@@ -1,396 +1,376 @@
-# HackerTerm 技术调研
+# HackerTerm 技术方案
 
-> 日期：2026-08-07 · 配套文档：`2026-08-07-hackerterm-v1-product-design.md`
-> 目的：在动手前把不确定性最高的几处摸清楚，避免写到一半返工。
+> 日期：2026-08-07 · 配套：`2026-08-07-hackerterm-v1-product-design.md`
+> **技术栈已定：Electron 外壳 + Rust 核心（napi-rs）+ VS Code 式 PTY 架构**
 
 ---
 
 ## 0. 结论速览
 
-| 层 | 选型 | 把握度 |
+| 层 | 选型 | 理由 |
 |---|---|---|
-| 语言 | Rust | 高 |
-| 终端内核 | `alacritty_terminal` + `vte` | 高 |
-| PTY | `portable-pty`，**Windows 需打 ConPTY 补丁** | ⚠️ 中，第 1 周必须验证 |
-| SSH | `russh`（纯 Rust）+ `russh-sftp` | 高 |
-| 文字渲染 | `glyphon`（cosmic-text + etagere + wgpu） | 中高 |
-| UI | `egui` + `egui_extras` 系表格生态 | ⚠️ 中，见 §3 |
-| GPU | `wgpu` → Metal / DX12 | 高 |
-| 数据库 | `sqlx`（MySQL + PG，纯 Rust） | 高 |
-| 本地存储 | SQLite（补全 + 操作日志） | 高 |
+| 外壳 | **Electron** | 两平台一个引擎（Chromium），行为一致；Chrome 进程模型白拿；Node 内置 |
+| 终端渲染 | **xterm.js + WebGL addon** | 比其它渲染器快 3-5 倍；大输出下瓶颈已转移到 PTY 投递，渲染不是瓶颈 |
+| PTY | **node-pty**（VS Code 同款） | Windows 走 ConPTY，旧版回退 winpty，已被 VS Code 打磨多年 |
+| PTY 架构 | **独立 PTY Host 进程 + 流控 + 事件批处理** | 见 §2，这是「大输出不卡」的真正答案 |
+| SSH / SFTP | **russh**（Rust，经 napi-rs 暴露） | 纯 Rust 无 C 依赖；微软有 `vscode-russh` fork |
+| 数据库 | **sqlx**（Rust，经 napi-rs） | 纯 Rust MySQL + PG |
+| 本地存储 | **SQLite**（Rust 侧） | 操作日志 + 补全索引 |
+| 补全查找 | **前缀树 Trie**（Rust 内存态） | 微秒级，主线程不碰磁盘 |
+| UI | Web（框架待定） | 数据网格、表单、i18n、拖拽全是成熟生态 |
+| 插件 | Node（Electron 自带） | 零成本，且 Claude Code / Codex 等 AI CLI 直接能跑 |
 
-**三个必须在第 1 周验证的风险点**：Windows ConPTY、中文输入法、字体渲染质量。
+### 为什么不是 Rust 原生 / Tauri
 
----
-
-## 1. 终端内核
-
-### 选 `alacritty_terminal` + `vte`
-
-- `vte`：ANSI/VT 转义序列解析状态机（基于 Paul Williams 的 DEC 解析器状态图）
-- `alacritty_terminal`：Term / Grid / Cursor / Scrollback / Selection / Search / PTY 派生
-- 许可 Apache-2.0，**Zed 编辑器的内置终端就是基于它**，生产验证充分
-
-**这一层等于白拿**：产品文档 §2② 要求的 VT 兼容性长尾（DEC 私有序列、CJK 宽字符、
-mouse 上报、bracketed paste）全都在里面，自己写要 6+ 人月。
-
-### 备选：`wezterm-term`
-MIT 许可，DEC 私有序列和 Sixel 覆盖更全。如果 alacritty_terminal 有兼容性缺口再换。
-
----
-
-## 2. PTY —— ⚠️ Windows 是最大的坑
-
-### 查到的问题
-
-`portable-pty` 上游 **不传现代 ConPTY 的创建标志**，导致在 Windows 10/11 上行为不正确。
-社区 fork（如 `portable-pty-psmux`）打了三个补丁：
-
-| 补丁 | 解决什么 |
+| 方案 | 否决理由 |
 |---|---|
-| `PASSTHROUGH_MODE` | VT 序列直通，不被 ConPTY 二次处理 |
-| `WIN32_INPUT_MODE` | 按键正确传递（否则组合键会丢） |
-| `RESIZE_QUIRK` | 修 resize 时的画面残留 |
+| Rust 原生（egui + winit） | UI 层全部手搓：可视化建表、快捷键管理器 + 6 套预设、连接表单、主题编辑器、数据网格，即时模式 GUI 里一个现成控件都没有。egui 中文输入法有已知问题、不带默认中文字体、API 仍在破坏性变更。跨窗口拖 Tab winit 什么都不给 |
+| Tauri | 技术上可行（WebView2 本身就是 Chromium 多进程），但 **macOS 用 WKWebView，两个引擎行为不一致，每个功能要各测一遍**。省下的装机体积换不来这个代价 |
 
-### 对我们的影响
+### 认下来的代价
 
-产品文档 §2② 承诺「`cat` 几十 MB 二进制文件不卡、能 `Ctrl+C` 立刻中断」，
-这三个补丁没打全的话，**Windows 上直接做不到**。
-
-### 行动
-**第 1 周就要在 Windows 上跑通一个最小 PTY demo**，验证：
-`cat` 大文件、`Ctrl+C` 中断、resize 无残留、组合键传递、PowerShell / CMD / WSL / Git Bash 四种都能起。
-
-> 这条不验证就开工，是整个项目最大的返工风险。
+| 代价 | 说明 |
+|---|---|
+| 装机 ~150MB | 用户已明确表示体积和内存不管 |
+| 冷启动 1-2 秒 | 用户已明确表示启动慢没事 |
+| **空闲 CPU 做不到 0%** | 产品文档 §7 那条要下调为「空闲时接近 0、不引起风扇转」 |
+| 「又一个 Electron 终端」的印象分 | 靠实际手感翻盘，见 §2 |
 
 ---
 
-## 3. UI 框架 —— ⚠️ 中文输入法是关键风险
-
-### 查到的情况
-
-**egui 的 IME 支持历史上很弱，但 2026 已有明显改善**：
-
-| 时间线 | 状态 |
-|---|---|
-| 早期 | eframe 原生端根本没有 IME，卡在 winit 没有 IME 支持 |
-| 现在 | winit 的 IME 支持已落地；egui TextEdit 支持 IME，有 composition 视觉和候选框定位 |
-| 已知 bug | #5544「IME 在 Linux 上从 v0.29.0 起失效」 |
-| 另一个坑 | **egui 不带默认中文字体**，要手动加载（issue #162 / #3060） |
-
-### 风险评估：比看上去小，但不能不管
-
-**好消息**：那个严重 bug (#5544) 是 **Linux 专有**，而我们**只发 Windows + macOS**，
-直接绕开了最严重的一个。
-
-**更重要的兜底**：终端面板**可以完全不依赖 egui 的 IME**。
-winit 直接提供了完整的 IME 接口：
+## 1. 整体架构
 
 ```
-Ime::Enabled   →  IME 已启用，开始接收后续事件
-Ime::Preedit   →  正在输入的候选文字 + 光标区间（拼音输入过程中的那串）
-Ime::Commit    →  确定上屏的文字
-Window::set_ime_cursor_area(位置, 大小)  →  告诉系统候选框画在哪
+┌──────────────────────────────────────────────────────────┐
+│  Electron 主进程                                          │
+│  窗口管理 · Tab 编排 · 自动更新 · 托盘 · 全局快捷键        │
+└────────┬─────────────────────────────┬───────────────────┘
+         │                             │
+┌────────▼──────────┐      ┌───────────▼──────────────────┐
+│  PTY Host 进程     │      │  Rust 核心（napi-rs 原生模块）│
+│  node-pty          │      │  SSH / SFTP（russh）          │
+│  ConPTY / Unix PTY │      │  数据库（sqlx）                │
+│  流控 XOFF/XON     │      │  补全索引（前缀树 + SQLite）    │
+│  事件批处理        │      │  操作日志（SQLite）             │
+│                   │      │  凭据存储 · 配置 · 授权检查     │
+└────────┬───────────┘      └───────────┬──────────────────┘
+         │                              │
+┌────────▼──────────────────────────────▼──────────────────┐
+│  渲染进程 —— 一个 Tab 一个                                 │
+│  终端 xterm.js + WebGL · 数据库网格 · 文件面板 · 表单       │
+└──────────────────────────────────────────────────────────┘
 ```
 
-也就是说**终端这块我们自己接 winit 的 IME，行为完全可控**，
-只有 SQL 编辑器、搜索框、连接表单这些用 egui 的地方依赖它的实现。
-
-### 为什么还是选 egui
-
-| 框架 | IME | 表格/数据网格 | 结论 |
-|---|---|---|---|
-| **egui** | 中（Win/Mac 可用，需手动配中文字体） | **强**：`egui_extras::TableBuilder`、`egui_deferred_table`、`egui_virtual_list`、`egui-selectable-table`，另有 Rerun Viewer 这样的生产案例 | ✅ 选它 |
-| iced | 中（有候选框定位修复的 PR） | 弱，没有成熟表格生态 | ❌ 数据库网格要从零造 |
-| Tauri | **最好**（WebView2 负责，完美） | 强（整个 Web 生态） | ❌ 已排除（性能与体积） |
-| gpui | — | 有 `gpui-component` | ❌ pre-1.0，官方不支持 Windows |
-
-**决定性因素是表格。** 产品文档 §9 的数据库结果网格要求虚拟滚动 + 单元格可编辑 +
-几十万行不卡，egui 生态里有四个现成的表格 crate，iced 里一个都没有。
-自己造这个控件是 2-3 人月。
-
-**egui 的代价要认**：API 仍在变，版本间有破坏性更新。要锁定版本，不跟着最新版跑。
-
-### 行动
-**第 1 周验证**：Windows 上用微软拼音和搜狗输入法，在终端面板和 egui 文本框里各打一段中文，
-看候选框位置、上屏、退格是否正常。
+**分工原则**：
+- **性能与安全关键 → Rust**（SSH、数据库、补全索引、操作日志、凭据）
+- **OS 胶水层 → 用被验证过的现成件**（node-pty）
+- **UI → Web 生态**（数据网格、表单、拖拽、i18n 全是成熟货）
 
 ---
 
-## 4. 文字渲染
+## 2. 「丝滑」怎么落地（产品文档 §2②）
 
-### 选 `glyphon`
+> **丝滑不是框架决定的，是架构决定的。**
+> Tabby 是 Electron 被喷，VS Code 也是 Electron 但终端很好。差别就在下面这几条。
 
-它就是「cosmic-text 排版 + etagere 打图集 + wgpu 采样」的成品，
-Emoji / 连字 / CJK / 字体回退全由 cosmic-text 负责。许可 Apache-2.0 / MIT / zlib。
+### 2.1 四条核心机制（照抄 VS Code）
 
-### 借鉴 iTerm2 的做法
-
-查了 iTerm2 Metal 渲染器的思路，和我们要做的完全一致：
-
-| iTerm2 的做法 | 对应我们的要求 |
-|---|---|
-| **CPU 管解析和状态，GPU 管画** | 产品文档 §2② 大量输出不卡 |
-| 每个格子是一个贴图四边形，**字形图集放在 GPU 内存** | 画 10000 个格子和画 100 个成本差不多 |
-| 把绘制从主线程挪走 | 主线程被慢绘制阻塞就会卡住数据处理 —— 这是 CPU 渲染终端的根本瓶颈 |
-| 验收标准：**`cat /dev/urandom` 不卡顿** | **和我们定的验收标准是同一个** |
-
-**这验证了产品文档 §2② 那条标准定得对**，是业内公认的硬指标。
-
-### 关键实现要点（决定"丝滑"成败）
-
-1. **只在有变化时重绘**（damage 驱动）—— 对应「无输出时 CPU 0%」
-2. **输出洪水时合并渲染**：疯狂刷屏时照样全量解析进 Grid，但**每个垂直同步周期只画最终状态一次**，不是每来一批数据画一次
-3. **解析线程和渲染线程解耦** —— 渲染慢不能阻塞 PTY 读取
-4. **伽马校正** —— 解决产品文档 §13.4 那条「换个配色字体就废了」
-
-### 行动
-**第 1 周验证**：亮色和暗色主题下截图对比字重，中英文混排看中文是否发糊，
-125% / 150% / 200% 缩放各看一遍。
-
----
-
-## 5. SSH
-
-### 选 `russh` + `russh-sftp`
-
-| | russh | ssh2 |
+| 机制 | 做法 | 解决什么 |
 |---|---|---|
-| 实现 | **纯 Rust**，基于 Tokio | libssh2 的 C 绑定 |
-| 依赖 | 无 C 库 | 需要系统 C 库，**编译复杂、构建时间长** |
-| SFTP | `russh-sftp`（客户端 + 服务端） | ssh2 自带 |
-| 背书 | **微软有 `vscode-russh` fork** | Rust 核心项目成员开发 |
+| **PTY Host 独立进程** | 渲染进程 ↔ PTY Host ↔ shell，PTY 读写不在渲染进程 | **大量输出不冻结界面** |
+| **流控 XOFF/XON** | xterm.js `useFlowControl`，**不让 pty 跑得比 xterm.js 快太多** | **`cat` 大文件不卡的真正答案**——不是渲染更快，是让数据别涌进来 |
+| **事件批处理** | 数据成批送到渲染进程，不是来一点送一次 | 减少无谓重绘和 IPC 次数 |
+| **WebGL 渲染器** | xterm.js WebGL addon（**不用 canvas / DOM 渲染器**） | 比其它渲染器快 3-5 倍 |
 
-选 russh 的理由：纯 Rust 意味着交叉编译和 Windows 构建简单得多，
-不用为了一个 C 库折腾 MSVC 工具链。微软在 VS Code 上 fork 它，说明生产可用。
+### 2.2 还要自己加的
 
-**注意**：产品文档 §5 要求多级跳板、三种隧道、代理（HTTP/SOCKS4/SOCKS5）——
-这些 russh 都要自己在上面搭一层，不是开箱即用。
+| 要求（产品文档 §7） | 做法 |
+|---|---|
+| 按键到显示 < 16ms | 按键走最短路径直达 PTY，不经过任何异步队列 |
+| 空闲时不重绘 | 无数据时不触发 render loop，**目标是接近 0% CPU 而不是绝对 0%** |
+| 10+ 会话并发刷屏互不影响 | 每个 Tab 独立渲染进程 + 各自独立的流控窗口 |
+| `Ctrl+C` 立刻中断 | 中断信号走带外通道，不排在输出数据队列后面 |
+
+### 2.3 验收方式
+必须做**并发压测**：同时开 10 个会话，其中 3 个 `cat` 大文件、3 个 `tail -f` 高速日志，
+在剩下的会话里敲命令，观察输入延迟和帧率。**不能只测单会话。**
+
+---
+
+## 2b. IPC —— 组件间通信（终端和数据库的共同瓶颈）
+
+### 先澄清：Mojo 用不了
+
+**Mojo 是 Chromium 内部的 C++ 框架，Electron 应用拿不到。**
+Electron 主进程连 Blink 都没有，所以也没有 DOM 的 `MessagePort` —— 它另提供了
+`MessagePortMain` / `MessageChannelMain`。
+
+但真正需要的三样能力，Electron 都有：
+
+| 需要什么 | Electron 的对应 |
+|---|---|
+| **组件直连，不走主进程中转** | `MessagePort`：渲染↔渲染、渲染↔主进程都能直连，绕开常规 IPC 开销 |
+| **大数据不拷贝** | **Transferable `ArrayBuffer`：转移内存所有权，不是克隆** |
+| **不阻塞 UI 线程** | 在 Web Worker 里收和解码，不在主世界处理 |
+
+> 注意：MessagePort 必须用 `ipcRenderer.postMessage` / `webContents.postMessage` 传递，
+> **常规的 `send` / `invoke` 传不了 MessagePort**。
+
+### 两条大数据链路，形态不同，分开设计
+
+| | 终端 | 数据库结果集 |
+|---|---|---|
+| 形态 | **高频小包**，持续不断 | **低频大包**，一次可能几 MB |
+| 关键指标 | 延迟 + 不积压 | 吞吐 + 不阻塞 UI |
+| 传什么 | 原始字节 `ArrayBuffer` | 列式二进制 `ArrayBuffer` |
+| 关键机制 | **流控 XOFF/XON** + 事件批处理 | **分页拉取** + Web Worker 解码 |
+| 路径 | PTY Host → MessagePort 直连渲染进程 | Rust 核心 → MessagePort → Worker → 虚拟滚动网格 |
+
+```
+终端链路（高频小包）
+  shell ──► PTY Host 进程 ──MessagePort + Transferable──► 渲染进程 ──► xterm.js
+                  ▲                                          │
+                  └────────── XOFF/XON 流控 ◄────────────────┘
+
+数据库链路（低频大包）
+  DB ──► Rust 核心（sqlx）──列式二进制 ArrayBuffer──► Web Worker 解码 ──► 网格
+              ▲                    (转移所有权，零拷贝)
+              └── 分页：滚到哪拉到哪，不一次性全量
+```
+
+### 三条铁律
+
+> **1. 绝不做 JSON 序列化**
+> **2. 绝不转成字符串再传**
+> **3. 绝不经主进程中转**
+
+这三样任何一个出现在大数据链路上，性能直接废掉。
+主进程只负责建立 MessagePort 连接，建好之后数据不再经过它。
+
+### 待验证
+Transferable 相比常规 IPC 的实测收益在传大块 `ArrayBuffer` 时约 10% 量级 ——
+**真正的大头是省掉序列化和主进程中转，不是 MessageChannel 本身的加速。**
+第 1 周压测要实测这条链路的端到端延迟。
+
+---
+
+## 3. PTY
+
+### 选 node-pty
+
+VS Code 同款。Windows 上默认 **ConPTY**（Win10 build 18309+），旧版回退 **winpty**。
+
+> 这条顺带解决了原先标红的 ConPTY 风险 —— node-pty 是被 VS Code 在海量 Windows
+> 机器上打磨过的，比自己从 Rust 侧调 ConPTY 稳妥得多。
+
+### 支持的 Shell（产品文档 §7）
+Windows：PowerShell · CMD · WSL · Git Bash
+macOS：zsh · bash
+启动时自动探测，用户可指定默认。
+
+---
+
+## 4. 终端渲染与字体
+
+### xterm.js + WebGL addon
+
+大输出测试（如 `ls -lR /usr/lib`）中，**瓶颈已经转移到 PTY 投递数据本身**，
+终端在等数据、其余时间空闲 —— 渲染不再是瓶颈。
+
+### 字体（产品文档 §13.4 的硬指标）
+
+| 要求 | 说明 |
+|---|---|
+| 换主题字体观感不变 | Chromium 的字体渲染在两平台一致，这条比 Rust 原生方案更容易达成 |
+| 中文不糊、中英混排清晰 | 字体栈里中英文分别指定 |
+| **连字** | ⚠️ xterm.js WebGL 渲染器 + 连字有已知问题（issue #3303），**第 1 周要验证** |
+| Nerd Font | 内置或检测系统已装的 |
+
+### 主题
+- 解析 `.itermcolors`（plist 格式）→ 转成 xterm.js 的 theme 对象，网上 325+ 套现成
+- 同一套颜色变量同时驱动终端、数据库网格、文件面板、整个界面
+- 提示符不管，交给 oh-my-zsh；只做检测 + 提示装 Nerd Font
+
+---
+
+## 5. SSH / SFTP
+
+### russh（Rust）经 napi-rs 暴露
+
+| | russh | ssh2（npm，libssh2） |
+|---|---|---|
+| 实现 | 纯 Rust，无 C 依赖 | C 库绑定 |
+| 构建 | 简单 | 需要 C 工具链 |
+| SFTP | russh-sftp | 自带 |
+| 背书 | 微软 `vscode-russh` fork | 老牌 |
+
+选 russh：产品文档 §5 要的多级跳板、三种隧道、代理（HTTP/SOCKS4/SOCKS5）
+都要在库之上自己搭一层，用 Rust 写这层比用 JS 写更合适。
+
+**文件管理复用同一条 SSH 连接的 SFTP 子系统**，不重新认证。
 
 ---
 
 ## 6. 数据库
 
-### 驱动选 `sqlx`
+### 驱动：sqlx（Rust）经 napi-rs
 
-纯 Rust 实现 MySQL 和 PostgreSQL 驱动，零 unsafe。
+MySQL + PostgreSQL，纯 Rust。
 
-**已知短板**：不支持 query pipelining（tokio-postgres 和 diesel-async 支持），
-有性能 issue #2436 反映比 tokio-postgres 慢。
+### 「结构解析不卡」（产品文档 §2③ 硬要求）
 
-**但对我们不是问题**：我们不是高并发服务端，是桌面客户端。
-瓶颈在「结构加载」和「大结果集分页」，不在单条查询的极限吞吐。
-
-### 「结构解析不卡」怎么做（产品文档 §2③ 的硬要求）
-
-DataGrip 卡死的原因是**一次性同步加载全部元数据**。我们的做法：
+DataGrip 卡死的根因是**一次性同步加载全部元数据**。我们的做法：
 
 | 策略 | 说明 |
 |---|---|
-| **懒加载** | 只加载当前展开的那一层。点开库才查表，点开表才查列 |
-| **并发拉取** | 同一层的多个对象并发查，不串行 |
-| **先出树后填详情** | 表名列表先出来（一条查询），行数/大小等慢字段后台补 |
-| **可取消** | 刷新时能随时取消，不锁界面 |
-| **落盘缓存** | 结构存本地，下次连上先用缓存渲染，后台比对更新 |
+| **懒加载** | 只加载当前展开的那一层：点开库才查表，点开表才查列 |
+| **并发拉取** | 同一层多个对象并发查，不串行 |
+| **先出树后填详情** | 表名先出来，行数/大小等慢字段后台补 |
+| **可取消** | 刷新随时能取消，不锁界面 |
+| **落盘缓存** | 结构存 SQLite，下次连上先用缓存渲染，后台比对更新 |
 
-最后一条同时解决产品文档 §8 的「结构没加载完也要有补全」——
-**补全读的是本地缓存，不是实时查询**。
+最后一条同时满足产品文档 §8「结构没加载完也要有补全」——
+**补全读的是本地缓存，不是实时查询。**
 
----
+### 大结果集
+分页流式拉取 + 前端虚拟滚动，绝不一次性拉进内存。
 
-## 7. 本地存储（补全 + 操作日志）
-
-### 选 SQLite
-
-产品文档 §12 要求操作日志「扛住几年、几十万条不变慢」，§8 要求补全「绝不卡」。
-
-| 用途 | 做法 |
-|---|---|
-| 操作日志 | SQLite 表，按时间和主机建索引 |
-| 补全候选 | 从操作日志派生的排序表（频率 × 新近度 × 目录 × 主机） |
-| 数据库结构缓存 | 按连接存一份，用于秒出补全 |
-| 前缀匹配 | 内存里维护一棵**前缀树（Trie）**，启动时从 SQLite 加载，增量更新 |
-
-> 名词澄清：之前提到的 **LSM-Tree** 是 RocksDB / LevelDB 的存储结构，
-> 和补全查找不是一回事（LSTM 则是神经网络，无关）。
-> 补全查找要的是**前缀树 Trie** —— 输入 `git ch` 秒出所有 `git ch*` 的候选。
-
-**「绝不卡」的实现原则**：查询走内存里的 Trie（微秒级），
-SQLite 只在后台线程读写，**主线程永远不碰磁盘**。
+### dump 导入导出
+直接调用系统的 `mysqldump` / `mysql` / `pg_dump` / `pg_restore` 子进程，
+不自己实现。流式读输出报进度，出错解析出行号。
 
 ---
 
-## 8. 进程隔离（产品文档 §2④ 硬条件）
-
-### 架构
+## 7. 补全（产品文档 §8 铁律：可以没有，绝不能卡）
 
 ```
-┌─────────────────┐        ┌──────────────────────────┐
-│  主进程（UI）    │ ◄────► │  每个 Tab 一个子进程       │
-│  渲染 / 交互     │  IPC   │  PTY / SSH / DB 连接      │
-│  连接树 / 设置   │        │  scrollback / 结果集      │
-└─────────────────┘        └──────────────────────────┘
+用户输入 → Rust 侧内存前缀树 Trie（微秒级）→ 返回候选
+                    ▲
+                    │ 启动时加载 / 增量更新（后台线程）
+              SQLite（操作日志派生的排序表 + 数据库结构缓存）
 ```
 
-| 好处 | 说明 |
+**「绝不卡」的保证**：查询只碰内存 Trie，**SQLite 读写永远在后台线程**，
+调用方拿不到结果就直接不显示，不等待。
+
+排序 = 频率 × 新近度 × 当前目录 × 当前主机。
+
+> 名词澄清：LSM-Tree 是 RocksDB / LevelDB 的存储结构，和补全查找不是一回事
+> （LSTM 是神经网络，无关）。补全查找要的是前缀树 Trie。
+
+---
+
+## 8. 进程隔离与崩溃（产品文档 §2④ 硬条件）
+
+### 直接继承 Chrome 的进程模型
+
+Electron = Chromium。**一个 Tab 一个渲染进程，崩溃隔离是白拿的。**
+Chrome 这套从 2008 年做到现在，最初动机就是崩溃隔离。
+
+| 产品承诺 | 怎么实现 |
 |---|---|
-| 一个 Tab 崩了不影响别的 | 子进程挂了主进程只是收到断开事件 |
-| 界面崩了会话不断 | 子进程还活着，重开 UI 重新接上 |
+| 一个 Tab 崩了不影响别的 | 渲染进程崩溃事件 → 那个 Tab 显示「已崩溃，点击重开」 |
+| 界面崩了 SSH 会话不断 | 会话活在 PTY Host / Rust 核心里，不在渲染进程 |
 | 更新重启不断会话 | 同上 |
-
-**代价**：内存翻倍（用户已明确表示不管）、IPC 有开销、调试更麻烦。
-
-### 要注意的
-渲染必须在主进程（GPU 上下文不好跨进程共享），所以子进程传的是**终端 Grid 的变化**，
-不是像素。这一层的 IPC 协议设计要早定，改起来很痛。
+| 画面出问题不白屏 | WebGL 初始化失败自动降级到 canvas 渲染器并提示 |
+| 异常退出恢复现场 | 定期快照窗口布局、Tab、每个 Tab 的目录 |
 
 ---
 
-## 9. 主题与字体
+## 9. Tab 拖出成窗口 / 拖回
 
-| 需求 | 做法 |
-|---|---|
-| 兼容 iTerm2 配色 | 解析 `.itermcolors`（plist 格式，含 16 色 + 前景/背景/光标/选中）。网上 325+ 套现成 |
-| 提示符 | **不做**，交给 oh-my-zsh |
-| oh-my-zsh 检测 | 读 `~/.zshrc` 的 `ZSH_THEME`，命中 agnoster / powerlevel10k 时提示装 Nerd Font |
-| 中文字体单独设 | cosmic-text 的字体回退链支持按字符范围指定 |
-| 字体不发虚 | 伽马校正 + 正确的子像素处理，见 §4 |
+Electron 多窗口是原生能力（`BrowserWindow`）。
 
----
-
-## 8b. Tab 拖出成窗口 / 拖回去
-
-### egui 多窗口：必须用「延迟视口」
-
-egui 0.24 起有 viewport API，eframe 原生端支持多窗口。两种模式：
-
-| 模式 | 重绘行为 | 通信 | 用不用 |
-|---|---|---|---|
-| **延迟视口**（deferred） | **各窗口独立重绘** | channel / Arc-Mutex，稍麻烦 | ✅ 用这个 |
-| 即时视口（immediate） | 父窗口重绘时子窗口跟着重绘，反之亦然 | 简单 | ❌ 一个窗口刷日志会拖着所有窗口重绘 |
-
-延迟视口"通信麻烦"这个代价对我们等于没有 —— **多进程架构本来就是消息通信**。
-
-### 我们的架构让「拖出去」变简单了
-
-Chrome 式拖出的核心难点是**要把 Tab 状态抽成可序列化的形式**才能跨窗口搬。
-
-而我们「一个 Tab 一个进程」：会话、PTY、scrollback 全在独立进程，窗口只是渲染端。
-**搬 Tab = 换个窗口连那个进程，状态一个字节都不用序列化。**
-这是进程隔离架构的意外红利。
-
-### 难度分级
+**架构红利**：会话活在 PTY Host / Rust 核心里，窗口只是渲染端 ——
+搬 Tab = 换个窗口去接那个会话，**状态一个字节都不用序列化**。
 
 | 能力 | 难度 | 要处理什么 |
 |---|---|---|
-| 拖出成新窗口 | 中 | 拖拽阈值防误触；**Windows 上要用 DWM Cloak 建窗口否则会闪一下** |
-| **拖回 / 拖到另一个窗口的 Tab 栏** | **高** | winit 不提供跨窗口命中测试，要自己用窗口位置 + 鼠标位置算；还要做 ghost tab 提示、拖动中窗口半透明 |
-| 窗口间同步（主题/设置变更） | 中 | 多窗口都要跟着变 |
+| 拖出成新窗口 | 中 | 拖拽阈值防误触；Windows 上建窗口要避免闪烁 |
+| 拖回 / 拖到另一窗口的 Tab 栏 | 中高 | 跨窗口命中测试 + ghost tab 提示 + 拖动中半透明 |
+| 右键 Tab →「移动到窗口 X」 | 低 | 拖拽的兜底入口，先做这个 |
 
-### 建议的分步
-
-1. **先做**：拖出成新窗口 + 右键 Tab「移动到窗口 X」（简易版拖回）
-2. **后做**：完整的 Chrome 式跨窗口拖放（ghost tab + 半透明反馈）
-
-> 这块是最容易出平台差异 bug 的地方之一，Windows 和 macOS 的窗口行为差别大。
-> 建议单独排一个验证。
+Web 生态里有成熟的拖拽库，比 Rust 原生方案省很多。
 
 ---
 
-## 9b. 国际化与授权口子
+## 10. 国际化与授权口子
 
-### 国际化（客户在国内也在国外）
+### 国际化（客户国内国外都有）
+- 文案全部走语言文件，代码里不出现面向用户的字符串字面量
+- **选能在构建期发现漏翻译的方案**，不能等运行时才发现
+- 布局按最长语言排（英文通常比中文长 30-50%）
+- 错误提示也必须进语言文件 —— 最容易漏，但用户最需要看懂
 
-V1 要中英双语。技术上不难，但**必须一开始就做，事后补会漏**：
-
-| 做法 | 说明 |
-|---|---|
-| 文案全部走语言文件 | 代码里不出现任何面向用户的字符串字面量 |
-| 用编译期检查的方案 | 少一条翻译要在构建时报错，不能等到运行时才发现 |
-| 布局按最长语言排 | 英文通常比中文长 30-50%，控件宽度不能按中文写死 |
-| 错误提示也进语言文件 | 最容易漏，但用户最需要看懂 |
-| 字体覆盖中英文 | 见 §9 |
-
-### 授权检查口子
-
-产品文档说 V1 可能有部分功能收费。所以这个口子**不是空壳**：
-
+### 授权检查
 ```
-功能执行前 → 授权检查（功能标识）→ 放行 / 拒绝
-                    ↓
-        V1：永远放行，但调用链真实存在
-        以后：读配置决定，不改功能代码
+功能执行前 → 授权检查(功能标识) → 放行 / 拒绝
+                  ↓
+      V1：永远放行，但调用链真实存在
+      以后：读配置决定，不改功能代码
 ```
-
-**关键是 V1 就真的调用它**，只是永远返回放行。
-如果只是"留个 TODO 以后插进来"，等真要限制的时候还是得把所有功能翻一遍。
-
-被拒绝时的界面行为也要现在定：**功能显示为不可用 + 说明原因**，
-不是点了没反应，也不是弹个报错。
+**关键是 V1 就真的调用它。** 只留 TODO 等于没留。
+被拒绝时：功能显示为不可用 + 说明原因，不是点了没反应也不是报错。
 
 ---
 
-## 10. 插件（V1 不做，方向已定）
+## 11. 插件与 AI CLI（V1 不做，方向已定）
 
-| 决定 | 理由 |
+**Electron 自带 Node，这块成本几乎为零。**
+
+| 决定 | 说明 |
 |---|---|
-| 进程外，stdio + JSON-RPC 2.0 | **和 MCP 完全同构**（MCP 就是 JSON-RPC 2.0 over stdio，官方主力 SDK 是 TypeScript），以后接 AI 生态几乎免费 |
-| 主推 JS，但不绑死语言 | 进程外通信天然语言无关 |
-| Node 运行时默认内置 | 版本可控；且 Claude Code / Codex 等 AI CLI 都是 Node 写的，这个运行时本身就是产品能力 |
+| 进程外，stdio + JSON-RPC 2.0 | 和 MCP 完全同构，以后接 AI 生态几乎免费 |
+| 主推 JS，不绑死语言 | 进程外通信天然语言无关 |
 | Lua 先不做 | 两套脚本语言 = 两套 API + 两倍 bug |
+| **内置 AI CLI 变简单了** | Claude Code / Codex 都是 Node CLI，**Electron 自带 Node，不用再单独内置运行时** |
 
 ---
 
-## 11. 排期现实（需要你知情）
+## 12. 打包分发（待细化）
 
-你之前定的是 1 个月 beta、2 个月 1.0，那时需求还只有「终端 + SSH + AI」。
-需求收完之后，V1 实际包含：
-
-> 终端（4 种 shell、分屏、拖出窗口、代理、Tab 多行）· 连接树（标签/颜色/分组/排序/5 种导入）·
-> 数据库（查询、输出区、改单元格、结构树、补全、**可视化建表**、5 种复制导出、dump 导入导出、库信息、危险操作确认）·
-> 文件管理 · 服务器信息面板 · 自动补全（命令 + SQL、本地 + 远程）· 操作日志 ·
-> **一个 Tab 一个进程** · 统一皮肤 + iTerm2 导入 + 字体渲染 · **快捷键管理器 + 6 套预设**
-
-**按 1-2 人算，这个范围更接近 6-9 个月，不是 2 个月。**
-UI 面积是主要成本：可视化建表、快捷键管理器、6 个分组的连接表单、主题设置，
-在 egui 这种即时模式框架里没有现成控件，每一个都要手搓。
-
-**这不是要你改目标，是让你知道排期紧张时该砍什么。** 建议的取舍：
-
-| 阶段 | 内容 |
+| 事项 | 状态 |
 |---|---|
-| **第 1 个月** | 风险验证（ConPTY / IME / 字体）+ 终端 + 连接树 + SSH + 主题 |
-| **第 2 个月** | 数据库查询 + 结果网格 + 补全 + 操作日志 → **这时候可以叫 beta** |
-| **第 3-4 个月** | 文件管理 + 服务器信息 + dump 导入导出 + 可视化建表 + 快捷键管理器 → **1.0** |
-
-**绝不能砍**：ConPTY 验证、IME 验证、一个 Tab 一个进程、补全不卡。
-前两个砍了会返工，后两个砍了产品没有存在理由。
+| Windows 代码签名 | 待办，不签会报毒 |
+| **macOS 公证** | 待办，**不公证用户下载下来直接打不开** |
+| 自动更新 | 增量更新 + 失败回滚；**企业版可完全禁用**（内网离线） |
+| 只发 Win + Mac | Linux 不发 |
 
 ---
 
-## 12. 第 1 周要做的三件事
+## 13. 第 1 周要验证的四件事
 
 | # | 验证什么 | 通过标准 |
 |---|---|---|
-| 1 | **Windows ConPTY** | `cat` 大文件不卡、`Ctrl+C` 能断、resize 无残留、四种 shell 都能起 |
-| 2 | **中文输入法** | 微软拼音 + 搜狗，在终端和文本框里候选框位置正确、上屏正常、退格正常 |
-| 3 | **字体渲染** | 亮/暗主题字重观感一致、中英混排中文不糊、125%/150%/200% 缩放清晰 |
+| 0 | **IPC 链路端到端延迟** | MessagePort + Transferable 直连，测终端字节从 PTY 到屏幕的延迟，以及几 MB 结果集的传输和解码耗时 |
+| 1 | **大输出并发压测** | 10 个会话，3 个 `cat` 大文件、3 个 `tail -f`，在其余会话敲命令不卡；`Ctrl+C` 立刻断 |
+| 2 | **中文输入法** | Win 微软拼音 + 搜狗、Mac 系统拼音，候选框位置、上屏、退格都正常 |
+| 3 | **字体与连字** | 亮/暗主题字重观感一致；中英混排中文不糊；**WebGL 渲染器 + 连字**（已知 issue #3303） |
+| 4 | **Tab 崩溃隔离** | 手动杀掉一个渲染进程，确认其它 Tab 照常、SSH 会话不断 |
 
-**这三件事任何一件不通过，都要在动手写业务代码前先解决。**
+**任何一件不通过，都要在写业务代码前先解决。**
+
+---
+
+## 待办：还没定的技术选型
+
+- 前端框架（React / Vue / Svelte / Solid）
+- 数据网格库（要支持虚拟滚动 + 单元格编辑 + 几十万行）
+- i18n 库（要构建期检查）
+- SQL 编辑器组件（要支持我们自己的补全接入）
+- 打包工具与自动更新方案
 
 ---
 
 ## 参考
 
-- [alacritty_terminal](https://crates.io/crates/alacritty_terminal) · [vte](https://crates.io/crates/vte)
-- [portable-pty ConPTY 补丁说明](https://lib.rs/crates/portable-pty-psmux) · [winpty-rs](https://github.com/andfoy/winpty-rs)
+- [VS Code 终端架构](https://deepwiki.com/microsoft/vscode/6-integrated-terminal) · [PTY Host 进程 + 流控 + 事件批处理 issue #74620](https://github.com/microsoft/vscode/issues/74620) · [VS Code 终端渲染器演进](https://code.visualstudio.com/blogs/2017/10/03/terminal-renderer)
+- [xterm.js](https://github.com/xtermjs/xterm.js/) · [WebGL Renderer PR #1790](https://github.com/xtermjs/xterm.js/pull/1790) · [@xterm/addon-webgl](https://www.npmjs.com/package/@xterm/addon-webgl) · [连字渲染问题 #3303](https://github.com/xtermjs/xterm.js/issues/3303)
+- [NAPI-RS](https://napi.rs/) · [Electron 中使用 napi-rs 示例](https://daveceddia.com/napi-rs-electron-example/) · [Electron 原生代码文档](https://www.electronjs.org/docs/latest/tutorial/native-code-and-electron)
+- [Chromium 多进程架构](https://www.chromium.org/developers/design-documents/multi-process-architecture/) · [进程模型与站点隔离](https://chromium.googlesource.com/chromium/src/+/main/docs/process_model_and_site_isolation.md)
+- [Electron MessagePorts 教程](https://www.electronjs.org/docs/latest/tutorial/message-ports) · [MessageChannelMain API](https://www.electronjs.org/docs/latest/api/message-channel-main) · [Electron IPC 文档](https://www.electronjs.org/docs/latest/tutorial/ipc) · [contextBridge 与 IPC 性能优化](https://coldfusion-example.blogspot.com/2026/01/electron-performance-optimizing.html)
+- [WebView2 进程模型](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/process-model)（用于对比 Tauri 路线）
 - [russh](https://github.com/Eugeny/russh) · [microsoft/vscode-russh](https://github.com/microsoft/vscode-russh)
-- [glyphon](https://github.com/grovesNL/glyphon)
-- [egui](https://github.com/emilk/egui) · [egui IME 支持 issue #248](https://github.com/emilk/egui/issues/248) · [CJK 支持 issue #3060](https://github.com/emilk/egui/issues/3060) · [Linux IME 失效 #5544](https://github.com/emilk/egui/issues/5544)
-- [egui_extras TableBuilder](https://docs.rs/egui_extras/latest/egui_extras/struct.TableBuilder.html) · [egui_deferred_table](https://lib.rs/crates/egui_deferred_table) · [egui_virtual_list](https://lib.rs/crates/egui_virtual_list)
-- [winit IME 事件](https://docs.rs/winit/latest/winit/event/enum.Ime.html)
-- [iTerm2 Metal Renderer Wiki](https://gitlab.com/gnachman/iterm2/-/wikis/Metal-Renderer) · [iTermMetalDriver.m](https://github.com/gnachman/iTerm2/blob/master/sources/Metal/iTermMetalDriver.m)
-- [Windows Terminal Atlas Engine](https://deepwiki.com/microsoft/terminal/3.2-atlas-engine)
-- [sqlx](https://github.com/launchbadge/sqlx) · [sqlx 性能 issue #2436](https://github.com/launchbadge/sqlx/issues/2436)
-- [Tauri / iced / egui 性能对比](http://lukaskalbertodt.github.io/2023/02/03/tauri-iced-egui-performance-comparison.html) · [2025 Rust GUI 库综述](https://www.boringcactus.com/2025/04/13/2025-survey-of-rust-gui-libraries.html)
+- [sqlx](https://github.com/launchbadge/sqlx)
+- [iTerm2 Color Schemes（325+ 套）](https://iterm2colorschemes.com/)
 - [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) · [MCP 传输层](https://modelcontextprotocol.info/docs/concepts/transports/)
