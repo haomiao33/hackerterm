@@ -16,6 +16,7 @@
 | SSH / SFTP | **russh**（Rust，经 napi-rs 暴露） | 纯 Rust 无 C 依赖；微软有 `vscode-russh` fork |
 | 数据库 | **sqlx**（Rust，经 napi-rs） | 纯 Rust MySQL + PG |
 | 本地存储 | **SQLite**（Rust 侧） | 操作日志 + 补全索引 |
+| **IPC** | **MessagePort + Transferable / SharedArrayBuffer；数据库走 Apache Arrow** | 零序列化、进程直连、不经主进程中转 |
 | 补全查找 | **前缀树 Trie**（Rust 内存态） | 微秒级，主线程不碰磁盘 |
 | UI | Web（框架待定） | 数据网格、表单、i18n、拖拽全是成熟生态 |
 | 插件 | Node（Electron 自带） | 零成本，且 Claude Code / Codex 等 AI CLI 直接能跑 |
@@ -99,13 +100,27 @@
 
 ## 2b. IPC —— 组件间通信（终端和数据库的共同瓶颈）
 
-### 先澄清：Mojo 用不了
+### 先澄清：Chromium 的 Mojo 抽不出来给我们用
 
-**Mojo 是 Chromium 内部的 C++ 框架，Electron 应用拿不到。**
-Electron 主进程连 Blink 都没有，所以也没有 DOM 的 `MessagePort` —— 它另提供了
-`MessagePortMain` / `MessageChannelMain`。
+| | 结论 |
+|---|---|
+| 技术上能不能抽出来 | **能**。C++ 绑定只依赖 Chromium 的 `//base` 一个库；C API 层几乎只依赖 libc / pthreads |
+| 官方支不支持 | **不支持**。Chromium 明确说维护这类移植不是他们的目标；**`//base` 不设计稳定 API**，随时会改 |
+| 有没有 Rust / Node 绑定 | **没有维护的** |
+| **决定性障碍** | **在 Electron 里插不进去** —— 渲染进程由 Electron 拉起，我们无法在它们之间建自己的 Mojo 通道。只能在自己 fork 的进程间用，而那些进程本来就能自由选协议，用 Mojo 毫无意义 |
 
-但真正需要的三样能力，Electron 都有：
+### 但 Mojo 快在哪，就直接拿那三样
+
+Mojo 不是魔法，它快就快在三件事，Electron 生态里都有成熟对应：
+
+| Mojo 的机制 | 我们用什么 |
+|---|---|
+| POD 不做序列化 | Transferable `ArrayBuffer` / 自定义二进制布局 / **Apache Arrow** |
+| 大负载走共享内存 | `SharedArrayBuffer` + `Atomics` 环形缓冲 |
+| 进程直连不中转 | `MessagePort` |
+
+Electron 主进程连 Blink 都没有，所以没有 DOM 的 `MessagePort`——
+它另提供了 `MessagePortMain` / `MessageChannelMain`。三样能力都在：
 
 | 需要什么 | Electron 的对应 |
 |---|---|
@@ -120,23 +135,38 @@ Electron 主进程连 Blink 都没有，所以也没有 DOM 的 `MessagePort` �
 
 | | 终端 | 数据库结果集 |
 |---|---|---|
-| 形态 | **高频小包**，持续不断 | **低频大包**，一次可能几 MB |
+| 形态 | **高频小包**，持续不断，**无结构原始字节** | **低频大包**，一次几 MB，**结构化表格** |
 | 关键指标 | 延迟 + 不积压 | 吞吐 + 不阻塞 UI |
-| 传什么 | 原始字节 `ArrayBuffer` | 列式二进制 `ArrayBuffer` |
-| 关键机制 | **流控 XOFF/XON** + 事件批处理 | **分页拉取** + Web Worker 解码 |
-| 路径 | PTY Host → MessagePort 直连渲染进程 | Rust 核心 → MessagePort → Worker → 虚拟滚动网格 |
+| 传什么 | 裸 `ArrayBuffer` | **Apache Arrow 列式格式** |
+| 关键机制 | **流控 XOFF/XON** + 事件批处理 | **分页拉取** + Worker 里零拷贝读 |
 
 ```
-终端链路（高频小包）
-  shell ──► PTY Host 进程 ──MessagePort + Transferable──► 渲染进程 ──► xterm.js
-                  ▲                                          │
-                  └────────── XOFF/XON 流控 ◄────────────────┘
+终端链路（高频小包，无结构）
+  shell ──► PTY Host ──MessagePort + Transferable ArrayBuffer──► 渲染进程 ──► xterm.js
+                ▲                                                    │
+                └──────────────── XOFF/XON 流控 ◄────────────────────┘
 
-数据库链路（低频大包）
-  DB ──► Rust 核心（sqlx）──列式二进制 ArrayBuffer──► Web Worker 解码 ──► 网格
-              ▲                    (转移所有权，零拷贝)
-              └── 分页：滚到哪拉到哪，不一次性全量
+  终端不套任何 schema —— 它就是字节流，裸 ArrayBuffer 就是最优解
+
+数据库链路（低频大包，结构化）
+  DB ──► Rust 核心 sqlx ──► arrow-rs 组装 ──SharedArrayBuffer──► Arrow JS 零拷贝读 ──► 网格
+                                  ▲                                    ▲
+                        列式内存布局，语言无关            只读元数据即可"反序列化"，
+                                                        不拷贝、不移动实际数据
+              分页：滚到哪拉到哪，不一次性全量
 ```
+
+### 为什么数据库这条用 Apache Arrow
+
+这就是「成熟的开源零拷贝 IPC 组件」，而且比 Mojo 贴合我们的场景得多：
+
+| 特性 | 说明 |
+|---|---|
+| 语言无关的列式内存格式 | 天生就是给"跨进程/跨语言传表格数据"设计的 |
+| **零拷贝读** | Arrow 的 IPC 消息**只读元数据就能"反序列化"成内存数组对象，不拷贝也不移动实际数据** |
+| Rust 侧成熟 | `arrow-rs` 是最成熟的实现之一，官方仓库就有 `zero_copy_ipc` 示例 |
+| **JS 侧有实现** | 前端直接用 Arrow JS 读，喂给虚拟滚动网格 |
+| 全程零序列化 | sqlx 查出来 → 组装成 Arrow → 传 → 前端读，一次序列化都没有 |
 
 ### 三条铁律
 
@@ -369,6 +399,8 @@ Web 生态里有成熟的拖拽库，比 Rust 原生方案省很多。
 - [NAPI-RS](https://napi.rs/) · [Electron 中使用 napi-rs 示例](https://daveceddia.com/napi-rs-electron-example/) · [Electron 原生代码文档](https://www.electronjs.org/docs/latest/tutorial/native-code-and-electron)
 - [Chromium 多进程架构](https://www.chromium.org/developers/design-documents/multi-process-architecture/) · [进程模型与站点隔离](https://chromium.googlesource.com/chromium/src/+/main/docs/process_model_and_site_isolation.md)
 - [Electron MessagePorts 教程](https://www.electronjs.org/docs/latest/tutorial/message-ports) · [MessageChannelMain API](https://www.electronjs.org/docs/latest/api/message-channel-main) · [Electron IPC 文档](https://www.electronjs.org/docs/latest/tutorial/ipc) · [contextBridge 与 IPC 性能优化](https://coldfusion-example.blogspot.com/2026/01/electron-performance-optimizing.html)
+- Mojo：[在 Chromium 之外使用 Mojo 的讨论](https://groups.google.com/a/chromium.org/g/chromium-mojo/c/BE3wGRpV9Rs) · [Chromium 独立库讨论](https://groups.google.com/a/chromium.org/d/topic/chromium-dev/rJUfp5RQZd4) · [Mojo 文档](https://chromium.googlesource.com/chromium/src/+/HEAD/mojo/README.md)
+- [Apache Arrow](https://arrow.apache.org/) · [Arrow 列式格式规范](https://arrow.apache.org/docs/format/Columnar.html) · [arrow-rs 零拷贝 IPC 示例](https://github.com/apache/arrow-rs/blob/main/arrow/examples/zero_copy_ipc.rs)
 - [WebView2 进程模型](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/process-model)（用于对比 Tauri 路线）
 - [russh](https://github.com/Eugeny/russh) · [microsoft/vscode-russh](https://github.com/microsoft/vscode-russh)
 - [sqlx](https://github.com/launchbadge/sqlx)
