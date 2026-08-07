@@ -1,7 +1,7 @@
 # HackerTerm 技术方案
 
 > 日期：2026-08-07 · 配套：`2026-08-07-hackerterm-v1-product-design.md`
-> **技术栈已定：Electron 外壳 + Rust 核心（napi-rs）+ VS Code 式 PTY 架构**
+> **技术栈已定：Electron 只做渲染，其余全部下沉 Rust 核心（napi-rs，跑在 utility process）**
 
 ---
 
@@ -11,14 +11,14 @@
 |---|---|---|
 | 外壳 | **Electron** | 两平台一个引擎（Chromium），行为一致；Chrome 进程模型白拿；Node 内置 |
 | 终端渲染 | **xterm.js + WebGL addon** | 比其它渲染器快 3-5 倍；大输出下瓶颈已转移到 PTY 投递，渲染不是瓶颈 |
-| PTY | **node-pty**（VS Code 同款） | Windows 走 ConPTY，旧版回退 winpty，已被 VS Code 打磨多年 |
-| PTY 架构 | **独立 PTY Host 进程 + 流控 + 事件批处理** | 见 §2，这是「大输出不卡」的真正答案 |
-| SSH / SFTP | **russh**（Rust，经 napi-rs 暴露） | 纯 Rust 无 C 依赖；微软有 `vscode-russh` fork |
-| 数据库 | **sqlx**（Rust，经 napi-rs） | 纯 Rust MySQL + PG |
+| PTY | **portable-pty**（Rust，需 ConPTY 补丁）| 按「除渲染外全用 Rust」原则下沉；node-pty 作为退路 |
+| PTY 架构 | **流控 XOFF/XON + 事件批处理**（借鉴 VS Code）| 见 §2，这是「大输出不卡」的真正答案 |
+| SSH / SFTP | **russh**（Rust） | 纯 Rust 无 C 依赖；微软有 `vscode-russh` fork |
+| 数据库 | **sqlx + arrow-rs**（Rust） | 纯 Rust MySQL + PG；结果集用 Arrow 列式格式回传 |
 | 本地存储 | **SQLite**（Rust 侧） | 操作日志 + 补全索引 |
 | **IPC** | **MessagePort + Transferable / SharedArrayBuffer；数据库走 Apache Arrow** | 零序列化、进程直连、不经主进程中转 |
 | 补全查找 | **前缀树 Trie**（Rust 内存态） | 微秒级，主线程不碰磁盘 |
-| UI | Web（框架待定） | 数据网格、表单、i18n、拖拽全是成熟生态 |
+| UI | Web（框架待定） | **只做渲染和交互**；数据网格、表单、i18n、拖拽全是成熟生态 |
 | 插件 | Node（Electron 自带） | 零成本，且 Claude Code / Codex 等 AI CLI 直接能跑 |
 
 ### 为什么不是 Rust 原生 / Tauri
@@ -39,33 +39,96 @@
 
 ---
 
-## 1. 整体架构
+## 1. 分层原则：核心下沉，外壳可换
+
+> **Electron 只做渲染和交互，其余一切在 Rust。**
+
+```
+┌───────────────────────────────────────────────────┐
+│  Electron —— 只做渲染和交互                        │
+│  xterm.js+WebGL · 数据网格 · 文件面板 · 表单 · 设置 │
+│  一个 Tab 一个渲染进程（崩溃隔离，沙箱开启）        │
+│  ★ 可替换层                                        │
+└──────────────────────┬────────────────────────────┘
+                       │ 薄接口：语言无关的消息协议
+                       │ MessagePort 直连，不经主进程
+┌──────────────────────▼────────────────────────────┐
+│  Rust 核心 —— 其余全部                             │
+│  PTY · SSH/SFTP · 数据库 · 补全索引 · 操作日志      │
+│  凭据 · 配置 · 授权 · 会话生命周期 · 流控           │
+│  ★ 资产层，不随外壳变                              │
+└───────────────────────────────────────────────────┘
+```
+
+### 为什么这么分（价值不只是性能）
+
+| 好处 | 说明 |
+|---|---|
+| **外壳可换** | Electron → Tauri → 原生 → 甚至 Web 版，**Rust 核心一行都不用改** |
+| **逻辑不散落** | 业务逻辑集中在 Rust，不会一半在 JS 一半在 Rust |
+| **可控** | 性能、安全、正确性关键的东西都在自己写的强类型代码里 |
+| **可测** | Rust 核心可以脱离 UI 单独跑测试 |
+
+### 拿到这个好处的前提（必须遵守）
+
+> **接口定成语言无关的消息协议，不是 napi 的函数签名。**
+
+如果 Rust 暴露的是一堆 `#[napi]` 函数，就绑死在 Node 上了，换外壳还得重写胶水层。
+定成**请求 / 响应 / 事件 + 二进制块**的消息协议，napi 只是当前宿主的传输实现之一。
+
+### Rust 核心放在哪
+
+**Electron utility process 里加载 napi-rs 原生模块。**
+
+| 为什么不放渲染进程 | Electron 2026 默认 `contextIsolation: true`、`nodeIntegration: false`、沙箱开启；**开 `nodeIntegration` 会直接关掉沙箱**，官方安全指引明确反对 |
+| 为什么不放主进程 | 主进程卡住整个应用就卡住；且主进程该保持只做编排 |
+| **为什么是 utility process** | 渲染进程保持沙箱；能和渲染进程 **MessagePort 直连不经主进程**；将来换宿主时 Rust 模块原样保留 |
+
+---
+
+## 1b. 整体架构
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  Electron 主进程                                          │
+│  Electron 主进程（JS，只做编排）                           │
 │  窗口管理 · Tab 编排 · 自动更新 · 托盘 · 全局快捷键        │
-└────────┬─────────────────────────────┬───────────────────┘
-         │                             │
-┌────────▼──────────┐      ┌───────────▼──────────────────┐
-│  PTY Host 进程     │      │  Rust 核心（napi-rs 原生模块）│
-│  node-pty          │      │  SSH / SFTP（russh）          │
-│  ConPTY / Unix PTY │      │  数据库（sqlx）                │
-│  流控 XOFF/XON     │      │  补全索引（前缀树 + SQLite）    │
-│  事件批处理        │      │  操作日志（SQLite）             │
-│                   │      │  凭据存储 · 配置 · 授权检查     │
-└────────┬───────────┘      └───────────┬──────────────────┘
-         │                              │
-┌────────▼──────────────────────────────▼──────────────────┐
-│  渲染进程 —— 一个 Tab 一个                                 │
+│  ★ 建立 MessagePort 连接后，数据不再经过它                 │
+└────────────────────────┬─────────────────────────────────┘
+                         │
+┌────────────────────────▼─────────────────────────────────┐
+│  Utility Process —— 宿主 Rust 核心（napi-rs）              │
+│                                                          │
+│   PTY（portable-pty，Windows 需 ConPTY 补丁）             │
+│   SSH / SFTP（russh）  ·  数据库（sqlx + arrow-rs）        │
+│   补全索引（前缀树 + SQLite）·  操作日志（SQLite）          │
+│   凭据存储 · 配置 · 授权检查 · 会话生命周期 · 流控          │
+│                                                          │
+│  ★ 对外只暴露语言无关的消息协议，不暴露 napi 函数签名      │
+└────────────────────────┬─────────────────────────────────┘
+                         │ MessagePort 直连（不经主进程）
+┌────────────────────────▼─────────────────────────────────┐
+│  渲染进程 —— 一个 Tab 一个（沙箱开启）                     │
 │  终端 xterm.js + WebGL · 数据库网格 · 文件面板 · 表单       │
 └──────────────────────────────────────────────────────────┘
 ```
 
 **分工原则**：
-- **性能与安全关键 → Rust**（SSH、数据库、补全索引、操作日志、凭据）
-- **OS 胶水层 → 用被验证过的现成件**（node-pty）
-- **UI → Web 生态**（数据网格、表单、拖拽、i18n 全是成熟货）
+- **除了画面，全在 Rust** —— PTY、SSH、数据库、补全、日志、凭据、配置、授权、流控
+- **Electron 只负责渲染和交互** —— 以及窗口/Tab 编排这些必须由外壳做的事
+- **UI 用 Web 生态** —— 数据网格、表单、拖拽、i18n 全是成熟货
+
+### PTY 用 Rust 而不是 node-pty
+
+按「除了渲染都用 Rust」的原则，PTY 也下沉到 Rust（`portable-pty`）。
+
+**代价要认**：`portable-pty` 上游**不传现代 ConPTY 的创建标志**，Win10/11 行为不正确。
+社区 fork 打了三个补丁：`PASSTHROUGH_MODE`（VT 直通）、`WIN32_INPUT_MODE`（组合键不丢）、
+`RESIZE_QUIRK`（resize 残留）。**必须确认这三个补丁到位**，否则「`cat` 大文件不卡 +
+`Ctrl+C` 立刻断」在 Windows 上做不到。
+
+> 备选方案：如果第 1 周验证发现 Rust 侧 ConPTY 坑太深，退回 node-pty（VS Code 同款，
+> 在海量 Windows 机器上打磨过）。**这是唯一一处允许破例用 JS 的地方**，
+> 因为它是纯 OS 胶水，不含业务逻辑，将来换外壳时重写成本也低。
 
 ---
 
@@ -78,7 +141,7 @@
 
 | 机制 | 做法 | 解决什么 |
 |---|---|---|
-| **PTY Host 独立进程** | 渲染进程 ↔ PTY Host ↔ shell，PTY 读写不在渲染进程 | **大量输出不冻结界面** |
+| **PTY 不在渲染进程** | 渲染进程 ↔ Rust 核心（utility process）↔ shell | **大量输出不冻结界面** |
 | **流控 XOFF/XON** | xterm.js `useFlowControl`，**不让 pty 跑得比 xterm.js 快太多** | **`cat` 大文件不卡的真正答案**——不是渲染更快，是让数据别涌进来 |
 | **事件批处理** | 数据成批送到渲染进程，不是来一点送一次 | 减少无谓重绘和 IPC 次数 |
 | **WebGL 渲染器** | xterm.js WebGL addon（**不用 canvas / DOM 渲染器**） | 比其它渲染器快 3-5 倍 |
@@ -142,7 +205,7 @@ Electron 主进程连 Blink 都没有，所以没有 DOM 的 `MessagePort`——
 
 ```
 终端链路（高频小包，无结构）
-  shell ──► PTY Host ──MessagePort + Transferable ArrayBuffer──► 渲染进程 ──► xterm.js
+  shell ──► Rust 核心(PTY) ──MessagePort + ArrayBuffer──► 渲染进程 ──► xterm.js
                 ▲                                                    │
                 └──────────────── XOFF/XON 流控 ◄────────────────────┘
 
@@ -177,18 +240,37 @@ Electron 主进程连 Blink 都没有，所以没有 DOM 的 `MessagePort`——
 这三样任何一个出现在大数据链路上，性能直接废掉。
 主进程只负责建立 MessagePort 连接，建好之后数据不再经过它。
 
+### 必须修正的一处：Electron 拿不到真正的零拷贝
+
+napi-rs 官方明确说明：**Electron 无法以零拷贝方式创建 Buffer**，
+napi-rs 会把 `Vec<u8>` 的数据**复制**进去；部分 JS 运行时不支持 external buffer，
+**Electron 就是其中之一**。
+
+**所以 Rust → JS 这最后一环是一次内存拷贝，不是零拷贝。**
+
+**但结论不变**：一次连续内存的 memcpy 在 10GB/s 量级，几 MB 的结果集约 1ms。
+**真正杀性能的是 JSON 序列化、字符串转换、主进程中转** —— 这三样我们全避开了。
+
+Arrow 的价值也依然成立：**它省掉的是序列化和逐行解析，不是那一次 memcpy。**
+
 ### 待验证
-Transferable 相比常规 IPC 的实测收益在传大块 `ArrayBuffer` 时约 10% 量级 ——
-**真正的大头是省掉序列化和主进程中转，不是 MessageChannel 本身的加速。**
-第 1 周压测要实测这条链路的端到端延迟。
+第 1 周压测要实测端到端延迟：终端字节从 PTY 到屏幕、几 MB 结果集的传输 + 解码。
 
 ---
 
 ## 3. PTY
 
-### 选 node-pty
+### 选 portable-pty（Rust），node-pty 作退路
 
-VS Code 同款。Windows 上默认 **ConPTY**（Win10 build 18309+），旧版回退 **winpty**。
+按「除渲染外全用 Rust」的原则下沉到 Rust 侧，跑在 utility process 的 Rust 核心里。
+
+**Windows 是关键**：必须走 **ConPTY**（Win10 build 18309+），旧版回退 **winpty**。
+`portable-pty` 上游不传现代 ConPTY 创建标志，**必须确认三个补丁到位**：
+`PASSTHROUGH_MODE` · `WIN32_INPUT_MODE` · `RESIZE_QUIRK`。
+
+> **退路**：第 1 周验证若发现 Rust 侧 ConPTY 坑太深，退回 node-pty（VS Code 同款，
+> 在海量 Windows 机器上打磨过）。这是唯一允许破例用 JS 的地方 ——
+> 纯 OS 胶水、不含业务逻辑，将来换外壳时重写成本也低。
 
 > 这条顺带解决了原先标红的 ConPTY 风险 —— node-pty 是被 VS Code 在海量 Windows
 > 机器上打磨过的，比自己从 Rust 侧调 ConPTY 稳妥得多。
@@ -300,7 +382,7 @@ Chrome 这套从 2008 年做到现在，最初动机就是崩溃隔离。
 | 产品承诺 | 怎么实现 |
 |---|---|
 | 一个 Tab 崩了不影响别的 | 渲染进程崩溃事件 → 那个 Tab 显示「已崩溃，点击重开」 |
-| 界面崩了 SSH 会话不断 | 会话活在 PTY Host / Rust 核心里，不在渲染进程 |
+| 界面崩了 SSH 会话不断 | 会话活在 Rust 核心里，不在渲染进程 |
 | 更新重启不断会话 | 同上 |
 | 画面出问题不白屏 | WebGL 初始化失败自动降级到 canvas 渲染器并提示 |
 | 异常退出恢复现场 | 定期快照窗口布局、Tab、每个 Tab 的目录 |
@@ -311,7 +393,7 @@ Chrome 这套从 2008 年做到现在，最初动机就是崩溃隔离。
 
 Electron 多窗口是原生能力（`BrowserWindow`）。
 
-**架构红利**：会话活在 PTY Host / Rust 核心里，窗口只是渲染端 ——
+**架构红利**：会话活在 Rust 核心里，窗口只是渲染端 ——
 搬 Tab = 换个窗口去接那个会话，**状态一个字节都不用序列化**。
 
 | 能力 | 难度 | 要处理什么 |
