@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      '@bufbuild/protobuf':
+        specifier: ^2.13.0
+        version: 2.13.0
     devDependencies:
       ts-proto:
         specifier: ^2.2.0
