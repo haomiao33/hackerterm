@@ -1,0 +1,11 @@
+[package]
+name = "ht-proto"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prost = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"

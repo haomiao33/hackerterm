@@ -1,0 +1,89 @@
+syntax = "proto3";
+package hackerterm.v1;
+
+message Envelope {
+  oneof kind {
+    Request  request  = 1;
+    Response response = 2;
+    Event    event    = 3;
+  }
+}
+
+message Request {
+  uint64 id      = 1;
+  string method  = 2;
+  bytes  payload = 3;
+}
+
+message Response {
+  uint64 id = 1;
+  oneof result {
+    bytes payload = 2;
+    Error error   = 3;
+  }
+}
+
+message Event {
+  string topic   = 1;
+  bytes  payload = 2;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNKNOWN          = 0;
+  ERROR_CODE_UNKNOWN_METHOD   = 1;
+  ERROR_CODE_INVALID_ARGUMENT = 2;
+  ERROR_CODE_NOT_FOUND        = 3;
+  ERROR_CODE_CONNECT_FAILED   = 6;
+  ERROR_CODE_TIMEOUT          = 8;
+  ERROR_CODE_CANCELLED        = 9;
+  ERROR_CODE_INTERNAL         = 11;
+}
+
+message Error {
+  ErrorCode code = 1;
+  string    key  = 2;
+  map<string, string> params = 3;
+  string    detail    = 4;
+  bool      retryable = 5;
+}
+
+message Hello {
+  uint32 protocol_major      = 1;
+  uint32 protocol_minor      = 2;
+  uint32 min_supported_major = 3;
+  string impl_version        = 4;
+  repeated string capabilities = 5;
+}
+
+// ---- session ----
+
+message SessionOpenRequest {
+  string shell = 1;   // 空则用系统默认
+  uint32 cols  = 2;
+  uint32 rows  = 3;
+  string cwd   = 4;
+}
+message SessionOpenResponse { string session_id = 1; }
+
+message SessionResizeRequest { string session_id = 1; uint32 cols = 2; uint32 rows = 3; }
+message SessionCloseRequest  { string session_id = 1; }
+message SessionAckRequest    { string session_id = 1; uint64 bytes_consumed = 2; }
+
+enum Signal {
+  SIGNAL_NONE = 0;
+  SIGNAL_INT  = 1;
+  SIGNAL_TERM = 2;
+  SIGNAL_KILL = 3;
+}
+message SessionSignalRequest { string session_id = 1; Signal signal = 2; }
+
+message Empty {}
+
+enum SessionState {
+  SESSION_STATE_UNKNOWN   = 0;
+  SESSION_STATE_CONNECTED = 1;
+  SESSION_STATE_CLOSED    = 2;
+  SESSION_STATE_FAILED    = 3;
+}
+message SessionStateEvent { string session_id = 1; SessionState state = 2; Error error = 3; }
+message SessionExitEvent  { string session_id = 1; int32 exit_code = 2; }
