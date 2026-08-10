@@ -1,0 +1,117 @@
+import { Terminal, type ITheme } from '@xterm/xterm'
+import { WebglAddon } from '@xterm/addon-webgl'
+import { FitAddon } from '@xterm/addon-fit'
+
+export interface TerminalHandle {
+  write(bytes: Uint8Array): void
+  dispose(): void
+}
+
+export interface MountOptions {
+  onInput(bytes: Uint8Array): void
+  onResize(cols: number, rows: number): void
+  /** 渲染层消费了多少字节，用于流控 */
+  onConsumed(bytes: number): void
+}
+
+/** 终端默认字号（px）。暂定值，等真机验证后按实际观感调整。 */
+const DEFAULT_FONT_SIZE_PX = 13
+
+// 亮/暗两套主题的取值本身不是本任务重点（暂定值，等设计稿定稿后替换）；
+// 重点是切换时必须连同 WebGL 纹理图集一起清空，见下面 applyTheme。
+const LIGHT_THEME: ITheme = { background: '#ffffff', foreground: '#1e1e1e' }
+const DARK_THEME: ITheme = { background: '#1e1e1e', foreground: '#d4d4d4' }
+
+function themeFor(prefersDark: boolean): ITheme {
+  return prefersDark ? DARK_THEME : LIGHT_THEME
+}
+
+/**
+ * 挂载一个 xterm.js 终端，WebGL 优先、DOM 兜底，并针对「字体发糊」做三处专门处理
+ * （详见 task-6-report.md）：
+ *
+ * 1. 主题切换（`prefers-color-scheme` 变化）：换主题的同时必须清空纹理图集，
+ *    否则旧主题的字形还留在图集里，新旧混杂导致边缘发虚。
+ * 2. `devicePixelRatio` 变化（换屏/缩放）：浏览器没有原生的“DPI 变了”事件，
+ *    xterm.js 自己也是用 `matchMedia` 监听 resolution 媒体查询做到的
+ *    （见 xterm 源码 `CoreBrowserService.ts` 的 `ScreenDprMonitor`，这里采用同样
+ *    的“查询失配就重新注册”手法）。这正是 xterm.js issue #1118 描述的场景
+ *    （高低 DPI 显示器之间切换需要刷新纹理图集）；#955/#2662 是同类问题的
+ *    另外两个已知案例。xterm.js 内部的自动处理只在 DPR 真变化时触发一次
+ *    `handleResize`，不保证等价于完全清图集，所以这里显式再清一次 + `fit()`。
+ * 3. WebGL 上下文丢失（典型触发场景：系统休眠唤醒）：只 `dispose()` 不重建的话，
+ *    终端会永久退化成 DOM 渲染器。这里在丢失后立即尝试重新创建一份 WebGL addon，
+ *    换一个新的上下文，把硬件加速渲染找回来；重建也失败就留在 DOM 渲染器，
+ *    不会白屏。
+ */
+export function mountTerminal(el: HTMLElement, opts: MountOptions): TerminalHandle {
+  const term = new Terminal({
+    fontFamily: 'Menlo, Consolas, monospace',
+    fontSize: DEFAULT_FONT_SIZE_PX,
+    allowProposedApi: true,
+    theme: themeFor(matchMedia('(prefers-color-scheme: dark)').matches),
+  })
+  const fit = new FitAddon()
+  term.loadAddon(fit)
+  term.open(el)
+
+  let webgl: WebglAddon | undefined
+
+  // WebGL 失败要降级而不是白屏（产品文档 §17 承诺③）。
+  function attachWebgl(): void {
+    try {
+      const addon = new WebglAddon()
+      addon.onContextLoss(() => {
+        addon.dispose()
+        webgl = undefined
+        attachWebgl() // 立刻尝试用新上下文重建，而不是永久退化成 DOM 渲染器
+      })
+      term.loadAddon(addon)
+      webgl = addon
+    } catch {
+      webgl = undefined
+      console.warn('WebGL renderer unavailable, falling back to DOM renderer')
+    }
+  }
+  attachWebgl()
+
+  fit.fit()
+  opts.onResize(term.cols, term.rows)
+
+  // --- 字体不糊之一：亮暗主题切换 ---
+  const themeQuery = matchMedia('(prefers-color-scheme: dark)')
+  const onThemeChange = (e: MediaQueryListEvent): void => {
+    term.options.theme = { ...themeFor(e.matches) }
+    webgl?.clearTextureAtlas() // 只改 theme 选项不够，图集里还留着旧主题的字形
+  }
+  themeQuery.addEventListener('change', onThemeChange)
+
+  // --- 字体不糊之二：devicePixelRatio 变化（换屏/系统缩放） ---
+  let dprQuery: MediaQueryList
+  const onDprChange = (): void => {
+    webgl?.clearTextureAtlas()
+    fit.fit()
+    registerDprWatcher() // 用新的 DPR 值重新注册监听，因为查询字符串里编了旧 DPR
+  }
+  function registerDprWatcher(): void {
+    dprQuery = matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`)
+    dprQuery.addEventListener('change', onDprChange, { once: true })
+  }
+  registerDprWatcher()
+
+  const enc = new TextEncoder()
+  term.onData((s) => opts.onInput(enc.encode(s)))
+  term.onResize(({ cols, rows }) => opts.onResize(cols, rows))
+
+  return {
+    write(bytes) {
+      // xterm 写完后回调，这时才算真正消费，用于流控
+      term.write(bytes, () => opts.onConsumed(bytes.byteLength))
+    },
+    dispose() {
+      themeQuery.removeEventListener('change', onThemeChange)
+      dprQuery.removeEventListener('change', onDprChange)
+      term.dispose()
+    },
+  }
+}

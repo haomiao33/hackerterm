@@ -1,2 +1,10 @@
 <!doctype html>
-<html><body><pre id="log">booting…</pre><script type="module" src="./boot.ts"></script></body></html>
+<html>
+<head>
+<style>
+  html, body { height: 100%; margin: 0; }
+  #terminal { height: calc(100% - 2rem); }
+</style>
+</head>
+<body><pre id="log">booting…</pre><div id="terminal"></div><script type="module" src="./boot.ts"></script></body>
+</html>

@@ -23,3 +23,9 @@ pub const FLOW_HIGH_WATER_BYTES: u64 = 1_048_576;
 ///
 /// 来源：暂定值，取高水位的 1/4。Task 7 压测确认最终比例。
 pub const FLOW_LOW_WATER_BYTES: u64 = 262_144;
+
+/// 读线程在 `should_pause()` 为真时，自旋轮询 `should_resume()` 的间隔（毫秒）。
+///
+/// 来源：暂定值。2ms 足够快以避免恢复延迟被用户感知（人眼可感知延迟约 100ms 起），
+/// 又足够粗以避免忙等吃满一个核心。Task 7 压测后可能改为条件变量而非轮询。
+pub const FLOW_PAUSE_POLL_INTERVAL_MS: u64 = 2;

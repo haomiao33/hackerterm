@@ -1,10 +1,10 @@
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 未确认字节数的滑动窗口：超过高水位就该暂停读 PTY，降到低水位再恢复（XOFF/XON 语义）。
 ///
-/// 骨架阶段（Task 6 · 阶段一）：字段与构造函数已定型，`on_sent`/`on_ack`/`outstanding`/
-/// `should_pause`/`should_resume` 留 `todo!()`，由阶段二实现并接入 `SessionManager` 的
-/// 读线程与 `session.ack`。高/低水位的默认取值见 [`crate::limits::FLOW_HIGH_WATER_BYTES`]
+/// 接入点：`SessionManager::open` 里的读线程在循环开头轮询 `should_pause()`、
+/// 读到数据后调 `on_sent`；`SessionManager::ack`（对应 `session.ack` 方法）调
+/// `on_ack`。高/低水位的默认取值见 [`crate::limits::FLOW_HIGH_WATER_BYTES`]
 /// 与 [`crate::limits::FLOW_LOW_WATER_BYTES`]。
 pub struct FlowWindow {
     outstanding: AtomicU64,
@@ -20,27 +20,31 @@ impl FlowWindow {
     }
 
     /// 记录又发送（读到并推给渲染层）了 `n` 字节，尚未确认。
-    pub fn on_sent(&self, _n: u64) {
-        todo!("阶段二实现：累加未确认字节数")
+    pub fn on_sent(&self, n: u64) {
+        self.outstanding.fetch_add(n, Ordering::SeqCst);
     }
 
     /// 记录渲染层确认消费了 `n` 字节。渲染层报的数字不可信，需要饱和减法防下溢。
-    pub fn on_ack(&self, _n: u64) {
-        todo!("阶段二实现：饱和减去已确认字节数，防止下溢（渲染层可能报出超过 outstanding 的数）")
+    pub fn on_ack(&self, n: u64) {
+        // fetch_update + saturating_sub：渲染层可能因为竞态/bug 报出超过
+        // outstanding 的数字，这里绝不能 panic 或下溢成一个巨大的 u64。
+        let _ = self.outstanding.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+            Some(cur.saturating_sub(n))
+        });
     }
 
     /// 当前未确认字节数。
     pub fn outstanding(&self) -> u64 {
-        todo!("阶段二实现：读取 outstanding 原子值")
+        self.outstanding.load(Ordering::SeqCst)
     }
 
     /// 未确认字节数是否已达到/超过高水位，读线程应当暂停读 PTY。
     pub fn should_pause(&self) -> bool {
-        todo!("阶段二实现：outstanding() >= self.high")
+        self.outstanding() >= self.high
     }
 
     /// 未确认字节数是否已降到低水位以下，读线程可以恢复读 PTY。
     pub fn should_resume(&self) -> bool {
-        todo!("阶段二实现：outstanding() < self.low")
+        self.outstanding() < self.low
     }
 }

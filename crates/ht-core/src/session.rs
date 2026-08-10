@@ -1,3 +1,4 @@
+use crate::flow::FlowWindow;
 use portable_pty::{ChildKiller, CommandBuilder, NativePtySystem, PtyPair, PtySize, PtySystem};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -15,6 +16,8 @@ pub struct Session {
     /// 防御性去重标记：确保 session.exit 只被等待线程的 on_exit 回调发送一次
     /// （VS Code terminalProcess.ts 用 `_store.isDisposed` 做同样的事，这里用原子 swap）。
     exited: Arc<AtomicBool>,
+    /// 未确认字节数的滑动窗口，读线程用它做 XOFF/XON 流控；`ack()` 从这里减。
+    flow: Arc<FlowWindow>,
 }
 
 pub struct SessionManager {
@@ -71,15 +74,34 @@ impl SessionManager {
             .take_writer()
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
+        // 流控窗口：未确认字节数超过高水位就暂停读 PTY，降到低水位再恢复。
+        // 水位值来自 limits.rs，不在这里写字面量。
+        let flow = Arc::new(FlowWindow::new(
+            crate::limits::FLOW_HIGH_WATER_BYTES,
+            crate::limits::FLOW_LOW_WATER_BYTES,
+        ));
+
         // 读线程：把字节推到数据通道。永远不阻塞控制面。
         let data_out = self.data_out.clone();
         let read_id = id.clone();
+        let read_flow = flow.clone();
         std::thread::spawn(move || {
             let mut buf = vec![0u8; crate::limits::READ_BUFFER_BYTES];
             loop {
+                // 未确认字节数超过高水位：暂停读 PTY，自旋等到降回低水位以下。
+                // 用轮询而不是条件变量，因为 ack 来自另一个（控制面）线程，
+                // 轮询间隔见 limits::FLOW_PAUSE_POLL_INTERVAL_MS 的注释。
+                while read_flow.should_pause() {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        crate::limits::FLOW_PAUSE_POLL_INTERVAL_MS,
+                    ));
+                }
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => data_out(read_id.clone(), buf[..n].to_vec()),
+                    Ok(n) => {
+                        data_out(read_id.clone(), buf[..n].to_vec());
+                        read_flow.on_sent(n as u64);
+                    }
                 }
             }
         });
@@ -100,7 +122,7 @@ impl SessionManager {
 
         self.sessions.lock().unwrap().insert(
             id.clone(),
-            Session { id: id.clone(), pair, writer, killer, exited },
+            Session { id: id.clone(), pair, writer, killer, exited, flow },
         );
         Ok(id)
     }
@@ -121,6 +143,13 @@ impl SessionManager {
     /// 中断信号走这里，不排在输出数据队列后面。
     pub fn signal_int(&self, id: &str) {
         self.write(id, &[0x03]); // Ctrl+C
+    }
+
+    /// 渲染层确认消费了 `n` 字节：降低未确认窗口，读线程据此判断能否恢复读 PTY。
+    pub fn ack(&self, id: &str, n: u64) {
+        if let Some(s) = self.sessions.lock().unwrap().get(id) {
+            s.flow.on_ack(n);
+        }
     }
 
     pub fn close(&self, id: &str) {

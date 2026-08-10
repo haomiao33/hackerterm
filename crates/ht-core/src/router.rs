@@ -55,6 +55,13 @@ impl Core {
                 }
                 Ok(ht_proto::pb::Empty {}.encode_to_vec())
             }
+            "session.ack" => {
+                let r = ht_proto::pb::SessionAckRequest::decode(&req.payload[..])
+                    .map_err(|e| dispatch::err(ht_proto::pb::ErrorCode::InvalidArgument,
+                                               "err.proto.bad_payload", e.to_string()))?;
+                self.sessions.ack(&r.session_id, r.bytes_consumed);
+                Ok(ht_proto::pb::Empty {}.encode_to_vec())
+            }
             "session.close" => {
                 let r = ht_proto::pb::SessionCloseRequest::decode(&req.payload[..])
                     .map_err(|e| dispatch::err(ht_proto::pb::ErrorCode::InvalidArgument,
