@@ -11,7 +11,7 @@
 |---|---|
 | **语言无关** | 协议里不出现任何 Node / napi / JS 概念。napi 只是当前宿主的传输实现之一 |
 | **外壳可换** | 换 Tauri、换原生、换 Web 版，**Rust 核心和本协议一行不改** |
-| **可演进** | 字段只增不改不复用；未知字段忽略；协议带版本号 |
+| **可演进** | 握手协商 major/minor + 能力集（§7）；字段只增不改不复用；未知字段/方法/事件一律安全忽略 |
 | **控制面与数据面分离** | 控制消息走 schema 编码，大数据走裸二进制，两者永不混在一起 |
 | **错误不带成品文案** | 传本地化 key + 参数，**渲染层负责翻译**（i18n 在渲染层） |
 | **凭据不出核心** | 明文凭据**永远不进入渲染进程**，只在 Rust 内部使用 |
@@ -115,7 +115,7 @@ message Error {
 }
 
 enum ErrorCode {
-  UNKNOWN            = 0;
+  UNKNOWN            = 0;   // ★ 所有 enum 的 0 值都必须是 UNKNOWN/NONE，见 §7.4
   UNKNOWN_METHOD     = 1;
   INVALID_ARGUMENT   = 2;
   NOT_FOUND          = 3;
@@ -434,24 +434,86 @@ message OpLogEntry {
 
 ## 7. 版本与演进
 
+### 7.1 握手
+
+任何通道建立后的**第一条消息必须是 `Hello`**，外壳先发，核心回。
+
 ```protobuf
 message Hello {
-  uint32 protocol_version = 1;
-  string core_version     = 2;
-  repeated string capabilities = 3;  // 如 "db.mysql" "db.postgres" "plugin.host"
+  uint32 protocol_major      = 1;  // 不兼容变更才 +1
+  uint32 protocol_minor      = 2;  // 向后兼容的新增
+  uint32 min_supported_major = 3;  // 对方低于这个就拒绝握手
+  string impl_version        = 4;  // 实现版本，如 "core-0.3.1"，仅用于日志和崩溃上报
+  repeated string capabilities = 5;
 }
 ```
 
-握手时外壳先发 `Hello`，核心回 `Hello`。取双方都支持的能力集。
+**协商规则**：
 
-**演进规则（硬性）**：
+| 情况 | 结果 |
+|---|---|
+| 双方 `major` 相同 | ✅ 通过。共同基线取 `min(minor_a, minor_b)` |
+| 一方 `major` 落在对方 `[min_supported_major, major]` 区间内 | ✅ 通过，按低的那个 major 走 |
+| 都不在对方支持区间 | ❌ 拒绝，返回 `Error{code: INTERNAL, key: "err.proto.version_mismatch"}`，**并明确告诉用户是哪一边旧了** |
+
+能力集取**交集**。
+
+### 7.2 能力名（capabilities）
+
+比版本号更重要 —— **判断"能不能用某功能"一律查能力，不查版本号**。
+
+```
+db.mysql          db.postgres       db.dump_import_export
+ssh.jump_chain    ssh.tunnel        ssh.proxy
+file.sftp         completion.sql    completion.shell
+oplog.search      sysinfo.probe     plugin.host
+entitlement.gate  config.policy
+```
+
+命名规范：`<域>.<能力>`，全小写下划线，只增不删（功能下线时保留名字但不再上报）。
+
+> **为什么不用版本号判断**：功能可能被回退、可能在不同分支各自加、
+> 企业版和个人版能力集也不同。`capabilities.contains("db.postgres")` 永远是对的，
+> `version >= 3` 迟早会错。
+
+### 7.3 六种变更怎么处理
+
+| 变更 | 做法 | 升什么 |
+|---|---|---|
+| **加字段** | 用新的字段编号，旧端自动忽略 | minor +1 |
+| **加方法** | 直接加，同时加一个 capability | minor +1 |
+| **加事件 topic** | 直接加，旧端忽略未知 topic | minor +1 |
+| **删字段** | 标 `reserved`，编号**永不复用** | minor +1 |
+| **破坏性改某个方法** | **加新方法名带后缀**，如 `db.query.exec2`，老方法保留至少一个大版本 | minor +1 |
+| **真的必须整体破坏** | 最后手段 | **major +1** |
+
+**禁止的做法**（会导致新旧端静默错乱，比崩溃更糟）：
+
+> ❌ **改已有字段的语义**（比如 `timeout` 从秒改成毫秒）
+> ❌ **复用已删除的字段编号**
+> ❌ **改已有方法的行为**（要改就用新方法名）
+
+改语义等同于新字段 —— 加个新字段，老字段标 `deprecated`。
+
+### 7.4 兼容性契约（双方都必须遵守）
 
 | 规则 | 说明 |
 |---|---|
-| 字段编号只增不改不复用 | 删字段只能标 `reserved` |
-| 未知字段忽略 | 新版核心 + 旧版外壳不能崩 |
-| 新方法不需要改信封 | 旧版收到不认识的 method 回 `UNKNOWN_METHOD` |
-| 能力协商而非版本判断 | 用 `capabilities` 判断能不能用，不用版本号大小比较 |
+| 未知字段 → 忽略 | 新版核心 + 旧版外壳不能崩 |
+| 未知 method → 回 `UNKNOWN_METHOD` | 不是解码失败，是明确的错误码 |
+| 未知 event topic → 静默丢弃 | 不报错、不打断 |
+| 未知 enum 值 → 当作 0（`UNKNOWN`）处理 | **所有 enum 的 0 值必须是 `UNKNOWN`/`NONE`** |
+| 新增方法必须配 capability | 否则调用方没法知道能不能调 |
+
+### 7.5 一个例子：以后加 Oracle 支持
+
+1. `DbKind` 加 `ORACLE = 3`（新枚举值，旧端收到当 `UNKNOWN` 处理，不会崩）
+2. 核心 `capabilities` 加 `db.oracle`
+3. `protocol_minor` +1
+4. 旧版外壳连新版核心：能力集里没有 `db.oracle`，界面就不显示 Oracle 选项，**其余功能照常**
+5. 新版外壳连旧版核心：同样查不到能力，同样不显示
+
+**全程不需要任何版本号大小比较，也不需要 major 升级。**
 
 ---
 
