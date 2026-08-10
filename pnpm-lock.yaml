@@ -6,7 +6,11 @@ settings:
 
 importers:
 
-  .: {}
+  .:
+    devDependencies:
+      ts-proto:
+        specifier: ^2.2.0
+        version: 2.12.0
 
   crates/ht-node:
     devDependencies:
@@ -16,11 +20,61 @@ importers:
 
 packages:
 
+  '@bufbuild/protobuf@2.13.0':
+    resolution: {integrity: sha512-acq7c49vxfm1ggJ95P70TX7ABDM0vxr1SYD3BB0o0jnBLB4OAqeHyKuN+cD3w80gXEDQ2zxHpR6CUeA+O/aU9g==}
+
   '@napi-rs/cli@2.18.4':
     resolution: {integrity: sha512-SgJeA4df9DE2iAEpr3M2H0OKl/yjtg1BnRI5/JyowS71tUWhrfSu2LT0V3vlHET+g1hBVlrO60PmEXwUEKp8Mg==}
     engines: {node: '>= 10'}
     hasBin: true
 
+  case-anything@2.1.13:
+    resolution: {integrity: sha512-zlOQ80VrQ2Ue+ymH5OuM/DlDq64mEm+B9UTdHULv5osUMD6HalNTblf2b1u/m6QecjsnOkBpqVZ+XPwIVsy7Ng==}
+    engines: {node: '>=12.13'}
+
+  detect-libc@1.0.3:
+    resolution: {integrity: sha512-pGjwhsmsp4kL2RTz08wcOlGN83otlqHeD/Z5T8GXZB+/YcpQ/dgo+lbU8ZsGxV0HIvqqxo9l7mqYwyYMD9bKDg==}
+    engines: {node: '>=0.10'}
+    hasBin: true
+
+  dprint-node@1.0.8:
+    resolution: {integrity: sha512-iVKnUtYfGrYcW1ZAlfR/F59cUVL8QIhWoBJoSjkkdua/dkWIgjZfiLMeTjiB06X0ZLkQ0M2C1VbUj/CxkIf1zg==}
+
+  ts-poet@6.12.0:
+    resolution: {integrity: sha512-xo+iRNMWqyvXpFTaOAvLPA5QAWO6TZrSUs5s4Odaya3epqofBu/fMLHEWl8jPmjhA0s9sgj9sNvF1BmaQlmQkA==}
+
+  ts-proto-descriptors@2.1.0:
+    resolution: {integrity: sha512-S5EZYEQ6L9KLFfjSRpZWDIXDV/W7tAj8uW7pLsihIxyr62EAVSiKuVPwE8iWnr849Bqa53enex1jhDUcpgquzA==}
+
+  ts-proto@2.12.0:
+    resolution: {integrity: sha512-ezMxg57ZiK/ZTW14U7y38+qyWHJr8cn8ELKuppANER666YnUteuNFO/mM1qI+9/wAHoTAfRadnIwtVdp1xw0jQ==}
+    hasBin: true
+
 snapshots:
 
+  '@bufbuild/protobuf@2.13.0': {}
+
   '@napi-rs/cli@2.18.4': {}
+
+  case-anything@2.1.13: {}
+
+  detect-libc@1.0.3: {}
+
+  dprint-node@1.0.8:
+    dependencies:
+      detect-libc: 1.0.3
+
+  ts-poet@6.12.0:
+    dependencies:
+      dprint-node: 1.0.8
+
+  ts-proto-descriptors@2.1.0:
+    dependencies:
+      '@bufbuild/protobuf': 2.13.0
+
+  ts-proto@2.12.0:
+    dependencies:
+      '@bufbuild/protobuf': 2.13.0
+      case-anything: 2.1.13
+      ts-poet: 6.12.0
+      ts-proto-descriptors: 2.1.0
