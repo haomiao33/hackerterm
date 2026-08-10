@@ -1,5 +1,6 @@
 pub mod dispatch;
 pub mod hello;
+pub mod session;
 
 pub use hello::{MIN_SUPPORTED_MAJOR, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 
