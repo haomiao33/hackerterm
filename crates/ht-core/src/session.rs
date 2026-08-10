@@ -75,7 +75,7 @@ impl SessionManager {
         let data_out = self.data_out.clone();
         let read_id = id.clone();
         std::thread::spawn(move || {
-            let mut buf = vec![0u8; 64 * 1024];
+            let mut buf = vec![0u8; crate::limits::READ_BUFFER_BYTES];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
