@@ -4,10 +4,10 @@ use ht_proto::{decode_envelope, encode_envelope};
 use prost::Message;
 use std::sync::{Arc, Mutex};
 
-fn collect() -> (Arc<Mutex<Vec<Vec<u8>>>>, Box<dyn Fn(Vec<u8>) + Send + Sync>) {
+fn collect() -> (Arc<Mutex<Vec<Vec<u8>>>>, Arc<dyn Fn(Vec<u8>) + Send + Sync>) {
     let sink = Arc::new(Mutex::new(Vec::new()));
     let s = sink.clone();
-    (sink, Box::new(move |b| s.lock().unwrap().push(b)))
+    (sink, Arc::new(move |b| s.lock().unwrap().push(b)))
 }
 
 #[test]

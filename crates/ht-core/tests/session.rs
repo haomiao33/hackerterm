@@ -11,7 +11,7 @@ fn core_with_sink() -> (Arc<Mutex<Vec<Vec<u8>>>>, Arc<Mutex<Vec<(String, Vec<u8>
     let c = ctrl.clone();
     let d = data.clone();
     let core = Core::new_with_data(
-        Box::new(move |b| c.lock().unwrap().push(b)),
+        Arc::new(move |b| c.lock().unwrap().push(b)),
         Box::new(move |sid, b| d.lock().unwrap().push((sid, b))),
     );
     (ctrl, data, core)

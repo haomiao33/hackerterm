@@ -7,3 +7,7 @@
 export declare function start(onMessage: (...args: any[]) => any): void
 /** 入站字节，转发给 Core 分发处理。 */
 export declare function send(buf: Buffer): void
+/** 注册数据面出站回调。**必须在 `start()` 之前调用**，由 JS 侧保证顺序。 */
+export declare function startData(onData: (...args: any[]) => any): void
+/** 渲染进程键盘输入，直接写数据面，不经过 protobuf。 */
+export declare function sendData(sessionId: string, buf: Buffer): void
