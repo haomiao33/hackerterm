@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ht-proto", "crates/ht-core", "crates/ht-node"]
+members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
