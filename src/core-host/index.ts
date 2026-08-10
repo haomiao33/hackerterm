@@ -6,12 +6,13 @@ const dataPorts = new Map<string, Electron.MessagePortMain>()
 
 startData((sessionId: string, buf: Buffer) => {
   const port = dataPorts.get(sessionId)
-  // 转成 ArrayBuffer 后 transfer，避免结构化克隆再拷一次
-  const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength)
-  // Electron 的 MessagePortMain.postMessage 类型声明把 transfer 列表标成
-  // MessagePortMain[]，但底层 Chromium 端口本就支持 transfer ArrayBuffer——
-  // 这是 Electron 官方类型定义的已知缺口，不是这里的逻辑错误，cast 掉即可。
-  port?.postMessage(ab, [ab] as unknown as Electron.MessagePortMain[])
+  // Electron 的 MessagePortMain（utility/主进程侧）不支持 transfer ArrayBuffer，
+  // 只接受 MessagePortMain[] 作为 transfer 列表——见 electron#34905（传
+  // ArrayBuffer 会整体丢数据）和 #46639（专门修传非法 transferable 导致的崩溃）。
+  // 这条限制只存在于 MessagePortMain 这一侧；渲染进程用的标准 DOM MessagePort
+  // 支持 ArrayBuffer transfer，方向相反时可以用。这里老老实实走一次
+  // structured clone 的内存拷贝，量级在 10GB/s，不是瓶颈。
+  port?.postMessage(new Uint8Array(buf))
 })
 
 start((buf: Buffer) => {

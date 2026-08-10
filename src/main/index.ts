@@ -3,14 +3,19 @@ import path from 'node:path'
 
 let core: Electron.UtilityProcess
 
+/** 默认窗口宽度。暂定值，等真机验证后按实际观感调整。 */
+const DEFAULT_WINDOW_WIDTH_PX = 1200
+/** 默认窗口高度。暂定值，等真机验证后按实际观感调整。 */
+const DEFAULT_WINDOW_HEIGHT_PX = 800
+
 function spawnCore() {
   core = utilityProcess.fork(path.join(__dirname, '../core-host/index.js'))
 }
 
 function createWindow() {
   const win = new BrowserWindow({
-    width: 1200,
-    height: 800,
+    width: DEFAULT_WINDOW_WIDTH_PX,
+    height: DEFAULT_WINDOW_HEIGHT_PX,
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       sandbox: true, // 全局约束：不得关闭
