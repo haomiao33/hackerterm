@@ -6,16 +6,23 @@
     "build:native": "pnpm --filter ht-node build",
     "test:native": "pnpm --filter ht-node test",
     "proto:ts": "mkdir -p src/ui/common/protocol && protoc --plugin=./node_modules/.bin/protoc-gen-ts_proto --ts_proto_out=src/ui/common/protocol --ts_proto_opt=esModuleInterop=true,outputJsonMethods=false,outputPartialMethods=false,useOptionals=messages -I proto proto/hackerterm.proto",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "dev": "electron-vite dev",
+    "build": "electron-vite build"
   },
   "dependencies": {
-    "@bufbuild/protobuf": "^2.13.0"
+    "@bufbuild/protobuf": "^2.13.0",
+    "ht-node": "workspace:^"
   },
   "devDependencies": {
+    "@types/node": "^26.2.0",
+    "electron": "^43.3.0",
+    "electron-vite": "^5.0.0",
     "eslint": "^10.8.1",
     "ts-proto": "^2.2.0",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.66.0",
+    "vite": "^7.3.6",
     "vitest": "^4.1.10"
   }
 }
