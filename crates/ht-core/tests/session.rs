@@ -94,3 +94,33 @@ fn closing_a_session_emits_exit_event() {
     });
     assert!(saw_exit, "expected a session.exit event");
 }
+
+#[test]
+fn closing_a_session_emits_exit_exactly_once() {
+    let (ctrl, _data, core) = core_with_sink();
+    let sid = open_session(&core, &ctrl);
+    std::thread::sleep(Duration::from_millis(800));
+
+    core.handle_inbound(&encode_envelope(&Envelope {
+        kind: Some(envelope::Kind::Request(Request {
+            id: 2,
+            method: "session.close".into(),
+            payload: ht_proto::pb::SessionCloseRequest { session_id: sid.clone() }.encode_to_vec(),
+        })),
+    }));
+    // 第二次 emit 来自子进程退出后等待线程的 on_exit 回调，需要等更久才会出现
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let out = ctrl.lock().unwrap();
+    let exit_count = out
+        .iter()
+        .filter(|b| {
+            matches!(decode_envelope(b).map(|e| e.kind),
+                Ok(Some(envelope::Kind::Event(ev))) if ev.topic == "session.exit")
+        })
+        .count();
+    assert_eq!(
+        exit_count, 1,
+        "expected exactly one session.exit event, got {exit_count}"
+    );
+}
