@@ -1,16 +1,27 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { start, send } from '../index.js'
+import { Envelope, Hello } from '../../../src/ui/common/protocol/hackerterm.ts'
 
-test('bytes sent into core come back through the callback', async () => {
+test('hello handshake round-trips through napi', async () => {
   const received = []
   start((buf) => received.push(Buffer.from(buf)))
 
-  send(Buffer.from([1, 2, 3]))
+  const payload = Hello.encode({
+    protocolMajor: 1, protocolMinor: 0, minSupportedMajor: 1,
+    implVersion: 'test', capabilities: ['terminal'],
+  }).finish()
 
-  await new Promise((r) => setTimeout(r, 100))
+  send(Buffer.from(Envelope.encode({
+    request: { id: 1, method: 'hello', payload },
+  }).finish()))
+
+  await new Promise((r) => setTimeout(r, 200))
 
   assert.equal(received.length, 1)
-  // M0 阶段核心把收到的字节原样回声，用于验证通道
-  assert.deepEqual([...received[0]], [1, 2, 3])
+  const env = Envelope.decode(received[0])
+  assert.equal(env.response.id, 1)
+  const coreHello = Hello.decode(env.response.payload)
+  assert.equal(coreHello.protocolMajor, 1)
+  assert.ok(coreHello.capabilities.includes('terminal'))
 })

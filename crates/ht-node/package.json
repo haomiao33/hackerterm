@@ -6,7 +6,7 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "test": "node --test"
+    "test": "node --experimental-transform-types --test"
   },
   "devDependencies": { "@napi-rs/cli": "^2.18.0" }
 }

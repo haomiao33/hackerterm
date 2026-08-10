@@ -8,6 +8,7 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+ht-core = { path = "../ht-core" }
 napi = { version = "2", default-features = false, features = ["napi6", "tokio_rt"] }
 napi-derive = "2"
 

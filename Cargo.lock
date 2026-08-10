@@ -123,6 +123,7 @@ dependencies = [
 name = "ht-node"
 version = "0.0.1"
 dependencies = [
+ "ht-core",
  "napi",
  "napi-build",
  "napi-derive",
