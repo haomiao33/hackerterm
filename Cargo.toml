@@ -1,0 +1,7 @@
+[workspace]
+members = ["crates/ht-proto", "crates/ht-core", "crates/ht-node"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Proprietary"

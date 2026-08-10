@@ -1,0 +1,9 @@
+{
+  "name": "hackerterm",
+  "private": true,
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "build:native": "pnpm --filter ht-node build",
+    "test:native": "pnpm --filter ht-node test"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "ht-node",
+  "version": "0.0.1",
+  "main": "index.js",
+  "napi": { "name": "ht-node" },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node --test __test__/"
+  },
+  "devDependencies": { "@napi-rs/cli": "^2.18.0" }
+}
