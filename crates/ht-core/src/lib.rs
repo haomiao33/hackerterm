@@ -93,9 +93,10 @@ impl Core {
                 let r = ht_proto::pb::SessionCloseRequest::decode(&req.payload[..])
                     .map_err(|e| dispatch::err(ht_proto::pb::ErrorCode::InvalidArgument,
                                                "err.proto.bad_payload", e.to_string()))?;
+                // 只 kill 子进程，不在这里直接 emit：唯一的 session.exit 发射点是
+                // open() 里等待线程的 on_exit 回调（子进程退出后自然触发），
+                // 避免这里再发一次导致重复事件（VS Code terminalProcess.ts 的单发射点模式）。
                 self.sessions.close(&r.session_id);
-                self.emit("session.exit",
-                    ht_proto::pb::SessionExitEvent { session_id: r.session_id, exit_code: 0 }.encode_to_vec());
                 Ok(ht_proto::pb::Empty {}.encode_to_vec())
             }
             other => Err(unknown_method(other)),
