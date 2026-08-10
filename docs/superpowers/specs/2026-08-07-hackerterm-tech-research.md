@@ -96,7 +96,7 @@
 └────────────────────────┬─────────────────────────────────┘
                          │
 ┌────────────────────────▼─────────────────────────────────┐
-│  Utility Process —— 宿主 Rust 核心（napi-rs）              │
+│  Utility Process —— 宿主 Rust 核心（napi-rs）★ 全局单实例  │
 │                                                          │
 │   PTY（portable-pty，Windows 需 ConPTY 补丁）             │
 │   SSH / SFTP（russh）  ·  数据库（sqlx + arrow-rs）        │
@@ -116,6 +116,37 @@
 - **除了画面，全在 Rust** —— PTY、SSH、数据库、补全、日志、凭据、配置、授权、流控
 - **Electron 只负责渲染和交互** —— 以及窗口/Tab 编排这些必须由外壳做的事
 - **UI 用 Web 生态** —— 数据网格、表单、拖拽、i18n 全是成熟货
+
+### Rust 核心是全局单实例（对应 VS Code 的 Shared Process）
+
+**不是每窗口一个，整个应用只有一个。**
+
+| 为什么必须单实例 | |
+|---|---|
+| 操作日志 | 全局一份，多实例会写乱 |
+| 补全索引 | 全局一棵前缀树，分裂就失去意义 |
+| 连接树 + 配置 | 一处改动要所有窗口立刻可见 |
+| SSH 连接复用 | 数据库走 SSH 隧道要复用同一条已建立的连接 |
+
+> 参照：VS Code 的 Shared Process 是一个全局隐藏窗口，**PTY host 和文件监视都是它的子进程**，
+> 各窗口通过 message ports 向它请求服务。详见 `2026-08-10-vscode-architecture-reference.md`。
+
+### UI 层必须按运行环境切目录（这是「外壳可换」的物理保障）
+
+照抄 VS Code 的做法 —— **不靠自觉，靠目录结构和 lint 强制**：
+
+```
+ui/
+├── common/      纯逻辑：状态管理、协议编解码、格式化、校验
+│                ★ 禁止 import 任何 DOM / Electron / Node
+├── browser/     用 DOM：组件、xterm.js 挂载、数据网格、拖拽
+│                ★ 禁止 import Electron
+└── electron/    用 Electron API：窗口、托盘、菜单、MessagePort 建立
+                 ★ 换外壳时只有这一层要重写
+```
+
+VS Code 正是靠这个切法，才能在做 vscode.dev（纯浏览器版）时让 `common` 部分一行不改。
+**必须配 lint 规则强制，否则写着写着就散了。**
 
 ### PTY 用 Rust 而不是 node-pty
 
