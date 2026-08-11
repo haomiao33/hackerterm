@@ -1,0 +1,161 @@
+name: Build & Verify (Windows)
+
+# 触发条件：推送到任意分支 + 手动触发，方便随时在 Actions 页面点一次。
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # build：产出 Windows x64 可执行文件并上传为 artifact。
+  # 这个 job 必须绿——它是用户下载 exe 的唯一来源。
+  # ────────────────────────────────────────────────────────────────
+  build:
+    name: build (windows-x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+
+      # prost-build 0.13（crates/ht-proto/build.rs 每次构建都调）不自带 protoc，
+      # Windows runner 上必须显式安装，否则 cargo build 在 build.rs 这一步就会失败。
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # 网络偶发抖动重试，最多 3 次。
+      - name: Install dependencies (pnpm install, retry x3)
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            pnpm install --frozen-lockfile && exit 0
+            echo "pnpm install failed (attempt $i/3), retrying in 5s..."
+            sleep 5
+          done
+          echo "pnpm install failed after 3 attempts"
+          exit 1
+
+      # 产出平台专有的 ht-node.win32-x64-msvc.node（crates/ht-node/index.js
+      # 这个 dispatcher 已入库，构建产物不入库，靠这一步在 CI 里现产）。
+      - name: Build native module (napi-rs)
+        run: pnpm build:native
+
+      # 产出 out/main、out/core-host、out/preload、out/ui/browser。
+      - name: Build Electron app
+        run: pnpm build
+
+      # electron-builder：见 package.json 的 "build" 字段。
+      # asarUnpack 保证 ht-node 的 .node 原生模块不会被塞进 asar 里导致加载失败。
+      - name: Package Windows exe
+        run: pnpm package:win
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hackerterm-windows-x64
+          path: release/*.exe
+          if-no-files-found: error
+
+  # ────────────────────────────────────────────────────────────────
+  # verify：把一部分手工 Windows 验证自动化。
+  #
+  # 重要：这个 job 大概率会红，这是预期的、也是有价值的——
+  # crates/ht-core/tests/session.rs 里的测试用 `yes` 这个命令刷屏，
+  # Windows 上默认 shell 是 powershell.exe，没有 `yes` 这个命令，
+  # 用来暴露哪些测试假设了类 Unix 环境、还不能直接在 Windows 上跑。
+  # 不要为了让这个 job 变绿去改测试——用 continue-on-error 让它跑完、
+  # 把完整输出留下来，供人工判断哪些测试要改，而不是拿测试结果本身当红绿灯。
+  # 因此不设 needs: build，两个 job 并行，verify 红不影响 build 产出 exe。
+  # ────────────────────────────────────────────────────────────────
+  verify:
+    name: verify (windows, non-blocking)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies (pnpm install, retry x3)
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            pnpm install --frozen-lockfile && exit 0
+            echo "pnpm install failed (attempt $i/3), retrying in 5s..."
+            sleep 5
+          done
+          echo "pnpm install failed after 3 attempts"
+          exit 1
+
+      # 预期会有失败（`yes` 在 Windows 上不存在等）。continue-on-error 让
+      # job 整体不因此变红阻塞任何人，但完整 stdout/stderr 仍会留在日志里。
+      - name: cargo test -p ht-core (Windows portability probe)
+        id: cargo_test
+        continue-on-error: true
+        run: cargo test -p ht-core -- --nocapture
+
+      # client.test.ts 用 vitest 写；仓库里另有一份 crates/ht-node/__test__/
+      # roundtrip.test.mjs 是 node:test 风格，两者不能用同一次 `vitest run`
+      # 扫描（会整体退出非 0），所以 package.json 的 test script 显式把
+      # 范围限定在 src 下（vitest run src），不触碰 crates/。
+      - name: TS-side tests (vitest)
+        id: ts_test
+        continue-on-error: true
+        run: pnpm test
+
+      - name: Summarize verify outcome
+        if: always()
+        shell: bash
+        run: |
+          echo "### Windows 验证结果（非阻塞，仅供参考）" >> "$GITHUB_STEP_SUMMARY"
+          echo "- cargo test -p ht-core: ${{ steps.cargo_test.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- vitest (src): ${{ steps.ts_test.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "这个 job 不阻塞 build job 产出 exe。红色是预期结果，用来暴露哪些测试还不能直接在 Windows 上跑（例如依赖 \`yes\` 命令、依赖 \`SHELL\` 环境变量），不代表 CI 配置本身有问题。" >> "$GITHUB_STEP_SUMMARY"
