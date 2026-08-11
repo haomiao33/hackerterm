@@ -13,16 +13,17 @@ pub struct Session {
     writer: Box<dyn Write + Send>,
     /// 独立于 `Child`（已被等待线程 move 走）的杀进程句柄，`close()` 用它主动终止子进程。
     killer: Box<dyn ChildKiller + Send + Sync>,
-    /// 防御性去重标记：确保 session.exit 只被等待线程的 on_exit 回调发送一次
-    /// （VS Code terminalProcess.ts 用 `_store.isDisposed` 做同样的事，这里用原子 swap）。
-    exited: Arc<AtomicBool>,
-    /// 未确认字节数的滑动窗口，读线程用它做 XOFF/XON 流控；`ack()` 从这里减。
+    /// 未确认字节数的滑动窗口，读线程用它做 XOFF/XON 流控；`ack()` 从这里减，
+    /// `close()` 从这里标记关闭（见 `FlowWindow::close`）。
     flow: Arc<FlowWindow>,
 }
 
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, Session>>,
     data_out: DataOut,
+    /// 当前存活的 PTY 读线程数量：spawn 前 +1，读线程 `loop` 退出后 -1。
+    /// 用于诊断与测试，确认会话关闭后读线程确实退出（见 `live_read_threads`）。
+    live_read_threads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// 默认 shell。Windows 用 PowerShell，macOS 用登录 shell。
@@ -36,7 +37,16 @@ fn default_shell() -> String {
 
 impl SessionManager {
     pub fn new(data_out: DataOut) -> Self {
-        Self { sessions: Mutex::new(HashMap::new()), data_out }
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            data_out,
+            live_read_threads: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// 当前存活的 PTY 读线程数量。用于诊断与测试，确认会话关闭后线程确实退出。
+    pub fn live_read_threads(&self) -> usize {
+        self.live_read_threads.load(Ordering::SeqCst)
     }
 
     pub fn open(
@@ -85,6 +95,8 @@ impl SessionManager {
         let data_out = self.data_out.clone();
         let read_id = id.clone();
         let read_flow = flow.clone();
+        self.live_read_threads.fetch_add(1, Ordering::SeqCst);
+        let live_read_threads = self.live_read_threads.clone();
         std::thread::spawn(move || {
             let mut buf = vec![0u8; crate::limits::READ_BUFFER_BYTES];
             loop {
@@ -94,11 +106,20 @@ impl SessionManager {
                 // FlowWindow::new 里 `low < high` 迟滞设计的意义。
                 // 用轮询而不是条件变量，因为 ack 来自另一个（控制面）线程，
                 // 轮询间隔见 limits::FLOW_PAUSE_POLL_INTERVAL_MS 的注释。
+                //
+                // 第二个退出条件 is_closed()：`SessionManager::close` remove 会话之后，
+                // `ack` 再也无法触达这个 flow（`sessions.lock().get(id)` 恒为 None），
+                // should_resume() 会永远是 false。没有 is_closed()，这个自旋在会话
+                // 关闭后就再也没有出口——`killer.kill()` 杀的是子进程，唤不醒卡在这里
+                // （根本没走到 `reader.read()`）的读线程。
                 if read_flow.should_pause() {
-                    while !read_flow.should_resume() {
+                    while !read_flow.should_resume() && !read_flow.is_closed() {
                         std::thread::sleep(std::time::Duration::from_millis(
                             crate::limits::FLOW_PAUSE_POLL_INTERVAL_MS,
                         ));
+                    }
+                    if read_flow.is_closed() {
+                        break;
                     }
                 }
                 match reader.read(&mut buf) {
@@ -109,13 +130,17 @@ impl SessionManager {
                     }
                 }
             }
+            live_read_threads.fetch_sub(1, Ordering::SeqCst);
         });
 
         // 等待线程：进程退出后发事件。这是 session.exit 的唯一发射点——
         // 无论子进程自己退出还是 close() 主动 kill 的，都在这里汇合成一次 on_exit。
+        // `exited_for_wait` 是防御性去重标记，确保 on_exit 只被这个线程调一次
+        // （VS Code terminalProcess.ts 用 `_store.isDisposed` 做同样的事，这里用原子
+        // swap）；只被这个闭包捕获，不需要也不应该存进 `Session`——没有别处会读它，
+        // 留在结构体上只是一个死字段。
         let exit_id = id.clone();
-        let exited = Arc::new(AtomicBool::new(false));
-        let exited_for_wait = exited.clone();
+        let exited_for_wait = Arc::new(AtomicBool::new(false));
         std::thread::spawn(move || {
             let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
             if exited_for_wait.swap(true, Ordering::SeqCst) {
@@ -127,7 +152,7 @@ impl SessionManager {
 
         self.sessions.lock().unwrap().insert(
             id.clone(),
-            Session { id: id.clone(), pair, writer, killer, exited, flow },
+            Session { id: id.clone(), pair, writer, killer, flow },
         );
         Ok(id)
     }
@@ -159,6 +184,10 @@ impl SessionManager {
 
     pub fn close(&self, id: &str) {
         if let Some(mut session) = self.sessions.lock().unwrap().remove(id) {
+            // 标记 flow 已关闭：暂停自旋中的读线程靠这个（而不是 ack）退出，见
+            // FlowWindow::close 的文档注释——remove 之后 ack 再也无法触达这个 flow，
+            // 不主动标记关闭的话，暂停中的读线程会永远等不到 should_resume()。
+            session.flow.close();
             // 主动杀子进程，让等待线程的 child.wait() 醒过来去发那唯一一次 session.exit。
             // 如果进程已经退出了（比如用户自己在 shell 里敲了 exit），kill 会失败，
             // 这里直接吞掉——等待线程早就在路上了，不需要再管。

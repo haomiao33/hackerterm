@@ -29,7 +29,10 @@ export default [
     files: ['src/ui/browser/**/*.ts'],
     rules: {
       'no-restricted-imports': ['error', {
-        patterns: [{ group: ['electron', 'electron/*'], message: 'ui/browser 不得依赖 Electron，换外壳时这层要能复用' }],
+        patterns: [
+          { group: ['electron', 'electron/*'], message: 'ui/browser 不得依赖 Electron，换外壳时这层要能复用' },
+          { group: ['node:*', 'fs', 'path', 'child_process'], message: 'ui/browser 是渲染进程，不得直接碰文件/进程（约束 3）' },
+        ],
       }],
     },
   },

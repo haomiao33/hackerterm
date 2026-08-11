@@ -40,6 +40,12 @@ impl Core {
         self.sessions.write(session_id, bytes);
     }
 
+    /// 当前存活的 PTY 读线程数量。转发 `SessionManager::live_read_threads`，
+    /// 用于诊断与测试，确认会话关闭后线程确实退出。
+    pub fn live_read_threads(&self) -> usize {
+        self.sessions.live_read_threads()
+    }
+
     /// 入站字节。解不出信封只能丢弃 —— 没有 id 就无法回响应，但绝不能崩。
     pub fn handle_inbound(&self, bytes: &[u8]) {
         let Ok(env) = decode_envelope(bytes) else {
@@ -73,16 +79,6 @@ impl Core {
             kind: Some(envelope::Kind::Response(Response {
                 id,
                 result: Some(result),
-            })),
-        };
-        (self.outbound)(encode_envelope(&env));
-    }
-
-    pub(crate) fn emit(&self, topic: &str, payload: Vec<u8>) {
-        let env = Envelope {
-            kind: Some(envelope::Kind::Event(ht_proto::pb::Event {
-                topic: topic.to_string(),
-                payload,
             })),
         };
         (self.outbound)(encode_envelope(&env));
