@@ -88,13 +88,18 @@ impl SessionManager {
         std::thread::spawn(move || {
             let mut buf = vec![0u8; crate::limits::READ_BUFFER_BYTES];
             loop {
-                // 未确认字节数超过高水位：暂停读 PTY，自旋等到降回低水位以下。
+                // 未确认字节数超过高水位：进入暂停，自旋等到真正降回低水位以下
+                // （should_resume()）才退出，不能用 !should_pause() 当退出条件——
+                // 那样只要降破高水位就恢复，会在高水位附近反复抖动，架空了
+                // FlowWindow::new 里 `low < high` 迟滞设计的意义。
                 // 用轮询而不是条件变量，因为 ack 来自另一个（控制面）线程，
                 // 轮询间隔见 limits::FLOW_PAUSE_POLL_INTERVAL_MS 的注释。
-                while read_flow.should_pause() {
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        crate::limits::FLOW_PAUSE_POLL_INTERVAL_MS,
-                    ));
+                if read_flow.should_pause() {
+                    while !read_flow.should_resume() {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            crate::limits::FLOW_PAUSE_POLL_INTERVAL_MS,
+                        ));
+                    }
                 }
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,

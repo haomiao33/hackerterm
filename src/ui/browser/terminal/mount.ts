@@ -17,6 +17,14 @@ export interface MountOptions {
 /** 终端默认字号（px）。暂定值，等真机验证后按实际观感调整。 */
 const DEFAULT_FONT_SIZE_PX = 13
 
+/**
+ * WebGL 上下文丢失后连续重建的次数上限。来源：暂定值，不是压测出来的——单纯是
+ * "不能无限递归/抖动"的保护，不做指数退避（没有观察到需要退避的症状，不引入
+ * 没验证过的复杂度）。正常场景（休眠/唤醒等）一次重建就够，连续丢 3 次基本可以
+ * 判定是 GPU 驱动本身有问题，此时放弃并留在 DOM 渲染器上更稳妥。
+ */
+const MAX_WEBGL_CONTEXT_LOSS_RETRIES = 3
+
 // 亮/暗两套主题的取值本身不是本任务重点（暂定值，等设计稿定稿后替换）；
 // 重点是切换时必须连同 WebGL 纹理图集一起清空，见下面 applyTheme。
 const LIGHT_THEME: ITheme = { background: '#ffffff', foreground: '#1e1e1e' }
@@ -41,8 +49,9 @@ function themeFor(prefersDark: boolean): ITheme {
  *    `handleResize`，不保证等价于完全清图集，所以这里显式再清一次 + `fit()`。
  * 3. WebGL 上下文丢失（典型触发场景：系统休眠唤醒）：只 `dispose()` 不重建的话，
  *    终端会永久退化成 DOM 渲染器。这里在丢失后立即尝试重新创建一份 WebGL addon，
- *    换一个新的上下文，把硬件加速渲染找回来；重建也失败就留在 DOM 渲染器，
- *    不会白屏。
+ *    换一个新的上下文，把硬件加速渲染找回来；连续丢失超过
+ *    `MAX_WEBGL_CONTEXT_LOSS_RETRIES` 次就放弃重建，留在 DOM 渲染器，
+ *    避免 GPU 驱动持续故障时无限递归重建抖动。
  */
 export function mountTerminal(el: HTMLElement, opts: MountOptions): TerminalHandle {
   const term = new Terminal({
@@ -56,6 +65,7 @@ export function mountTerminal(el: HTMLElement, opts: MountOptions): TerminalHand
   term.open(el)
 
   let webgl: WebglAddon | undefined
+  let contextLossCount = 0
 
   // WebGL 失败要降级而不是白屏（产品文档 §17 承诺③）。
   function attachWebgl(): void {
@@ -64,6 +74,15 @@ export function mountTerminal(el: HTMLElement, opts: MountOptions): TerminalHand
       addon.onContextLoss(() => {
         addon.dispose()
         webgl = undefined
+        // 连续丢失次数超过上限：多半是 GPU 驱动本身有问题，放弃重建，
+        // 留在 DOM 渲染器上，避免无限递归重建抖动。
+        if (contextLossCount >= MAX_WEBGL_CONTEXT_LOSS_RETRIES) {
+          console.warn(
+            `WebGL context lost ${contextLossCount + 1} times in a row, giving up and staying on DOM renderer`,
+          )
+          return
+        }
+        contextLossCount += 1
         attachWebgl() // 立刻尝试用新上下文重建，而不是永久退化成 DOM 渲染器
       })
       term.loadAddon(addon)
