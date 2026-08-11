@@ -33,17 +33,27 @@ export function createOnDataLogger(): (bytes: Uint8Array) => void {
 const INCOMING_DATA_SUMMARY_INTERVAL = 50
 
 /**
- * PTY -> 渲染方向的数据量通常很大（比如 cat 一个大文件），这里只做累计
- * 字节数的节流汇总，不逐条打印、不打 hex。
+ * PTY -> 渲染方向的数据量通常很大（比如 cat 一个大文件），量大之后只做
+ * 累计字节数的节流汇总，不打 hex。但前 ONDATA_FULL_LOG_COUNT 条必须
+ * 逐条打印——这段是回显能不能回来的第一手证据，跟 onData 那侧对称：
+ * 用户敲了几十个字符，日志里如果只有第 1 条，没法判断是"回显没回来"
+ * 还是"消息数还没到 INCOMING_DATA_SUMMARY_INTERVAL"。复用
+ * ONDATA_FULL_LOG_COUNT 而不是另开一个常量，就是要让两个方向的"前 N 条
+ * 逐条打印"用同一个量级，对称。
  */
 export function createIncomingDataLogger(): (byteLength: number) => void {
   let callCount = 0
   let totalBytes = 0
+  let bytesSinceSummary = 0
   return (byteLength: number) => {
     callCount += 1
     totalBytes += byteLength
-    if (callCount === 1 || callCount % INCOMING_DATA_SUMMARY_INTERVAL === 0) {
-      log(`data received: cumulative ${totalBytes}B over ${callCount} messages`)
+    bytesSinceSummary += byteLength
+    if (callCount <= ONDATA_FULL_LOG_COUNT) {
+      log(`data received #${callCount}: ${byteLength}B (cumulative ${totalBytes}B)`)
+    } else if (callCount % INCOMING_DATA_SUMMARY_INTERVAL === 0) {
+      log(`data received #${callCount} summary: +${bytesSinceSummary}B since last summary (cumulative ${totalBytes}B)`)
+      bytesSinceSummary = 0
     }
   }
 }

@@ -1,4 +1,10 @@
 import { Terminal, type ITheme } from '@xterm/xterm'
+// xterm.js 的核心样式表：没有它 .xterm-helper-textarea 会失去隐藏样式变成一个
+// 可见的小方框（真机反馈"框太小"的根因），.xterm-viewport/.xterm-screen/
+// .xterm-rows 也会失去定位、溢出、行排版规则。曾经整个 src/ 里没有任何 CSS
+// import，这里补上——挂载点选在这里而不是 boot.ts/index.html，因为样式和
+// "谁在用 xterm" 这个事实是绑在一起的，属于这个模块自己的职责。
+import '@xterm/xterm/css/xterm.css'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { FitAddon } from '@xterm/addon-fit'
 import { log } from '../diagnostics/log'
