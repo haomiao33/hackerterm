@@ -17,6 +17,48 @@ fn core_with_sink() -> (Arc<Mutex<Vec<Vec<u8>>>>, Arc<Mutex<Vec<(String, Vec<u8>
     (ctrl, data, core)
 }
 
+/// 用来把未确认字节数推过高水位的"刷屏"命令，按 shell 分平台给出。
+///
+/// 原因：`default_shell()`（`crates/ht-core/src/session.rs`）在 Windows 上返回
+/// `powershell.exe`，容器 / CI 的 Linux 上则走 `$SHELL`（一般是 bash/zsh）。`yes`
+/// 是 GNU coreutils / BSD 自带的命令，PowerShell 里没有对应内建命令或 cmdlet，直接
+/// 报 "not recognized"，不产出任何字节——这正是本文件三个流控测试在真实 Windows
+/// GitHub Actions 上超时失败的根因（越不过高水位）。
+///
+/// - Unix（bash/zsh）：`yes hackerterm` —— coreutils 自带，无限重复打印一行
+///   "hackerterm"，直到进程被杀。
+/// - Windows（PowerShell）：`while ($true) { 'hackerterm' }` —— PowerShell 内建
+///   语法的无限循环；循环体里裸的字符串字面量会被 PowerShell 自动写到成功输出流
+///   （这是 PowerShell 管道模型的默认行为，等价于显式 `Write-Output 'hackerterm'`），
+///   效果上等价于 Unix 的 `yes hackerterm`：持续不断地把这行字符串灌进输出。
+///
+/// 行尾用 `\r\n`（仅 Windows 分支）而不是单独的 `\n`：命令要经 PTY 写进 shell 的
+/// 输入，"提交一行"在终端协议里对应的按键是 Enter，Enter 在终端协议里编码成 CR
+/// （`\r` / 0x0D），不是 LF。依据：
+/// 1. `node-pty`——Node.js 生态里对应 `portable_pty`（本项目在用）的同类库，在
+///    Windows 上同样基于 Win32 ConPTY API——官方 README 演示提交命令用的是
+///    `ptyProcess.write('ls\r')`，显式用 `\r`。
+/// 2. 本文件里已经在真实 Windows CI 上跑通的另外 5 个测试（比如
+///    `writing_to_a_session_echoes_back`）目前写的是裸 `\n`，说明这一路
+///    portable_pty ConPTY / PowerShell 组合眼下确实也接受单独的 `\n`；但这是这份
+///    技术栈的实现细节而非协议保证，`\r` 才是"按下 Enter"在终端协议里语义正确的
+///    字节。写 `\r\n` 两头都占：既满足"CR 才是 Enter"这个更保守的读法，也不破坏
+///    "\n 也能被接受"这个已被验证过的行为——万一多出来的换行被当成一次多余的空
+///    Enter，`while ($true) {...}` 这种永不把提示符还给用户的无限循环后面顶多排一
+///    个空行，不会被执行、没有副作用。
+/// 3. 以上关于 Windows/PowerShell/ConPTY 行输入行为的推理**未在真实 Windows 上实
+///    测过**，只在 Linux 容器里能确认 Unix 分支能跑；Windows 分支待下一次 CI 跑
+///    Windows 才能确认。
+#[cfg(windows)]
+fn flood_command_bytes() -> &'static [u8] {
+    b"while ($true) { 'hackerterm' }\r\n"
+}
+
+#[cfg(not(windows))]
+fn flood_command_bytes() -> &'static [u8] {
+    b"yes hackerterm\n"
+}
+
 fn open_session(core: &Core, ctrl: &Arc<Mutex<Vec<Vec<u8>>>>) -> String {
     let payload = SessionOpenRequest {
         shell: String::new(),
@@ -171,7 +213,8 @@ fn session_ack_is_routed_without_error() {
 /// 就会退出自旋、恢复读取——`should_resume()` 在生产代码里从未被调用过。
 ///
 /// 复现思路：
-/// 1. 用 `yes` 让某个会话持续产出，把未确认字节数推过高水位；
+/// 1. 用刷屏命令（`flood_command_bytes()`，Unix 上是 `yes hackerterm`，Windows 上是
+///    PowerShell 的 `while ($true) { 'hackerterm' }`）让某个会话持续产出，把未确认字节数推过高水位；
 /// 2. 只 ack 一部分，让未确认字节数落在「低水位 < x < 高水位」这个区间——
 ///    按文档，这个区间里读线程应该继续保持暂停；
 /// 3. 等一段远大于轮询间隔（`FLOW_PAUSE_POLL_INTERVAL_MS` = 2ms）的时间，
@@ -189,7 +232,7 @@ fn read_thread_waits_for_low_water_before_resuming() {
     std::thread::sleep(Duration::from_millis(1000));
 
     // 持续产出的命令：把未确认字节数推过高水位。
-    core.write_data(&sid, b"yes\n");
+    core.write_data(&sid, flood_command_bytes());
 
     fn total_bytes_for(data: &Arc<Mutex<Vec<(String, Vec<u8>)>>>, sid: &str) -> u64 {
         data.lock()
@@ -209,7 +252,7 @@ fn read_thread_waits_for_low_water_before_resuming() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "5s 内未能让输出越过高水位（{FLOW_HIGH_WATER_BYTES} 字节）——`yes` 是否真的在产出？"
+            "5s 内未能让输出越过高水位（{FLOW_HIGH_WATER_BYTES} 字节）——刷屏命令（flood_command_bytes()）是否真的在产出？"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -260,11 +303,11 @@ fn read_thread_waits_for_low_water_before_resuming() {
 
     // 轮询间隔是 2ms（FLOW_PAUSE_POLL_INTERVAL_MS）：500ms 远够让「正确实现」
     // 稳稳地停在暂停态，也远够让「有 bug 的实现」明显恢复读取并吐出大量新数据
-    // （`yes` 吐字节的速度远高于 500ms 内几 KB 的量级）。
+    // （刷屏命令吐字节的速度远高于 500ms 内几 KB 的量级）。
     std::thread::sleep(Duration::from_millis(500));
     let n2 = total_bytes_for(&data, &sid);
 
-    // 不管下面的断言成不成立，先关掉会话——别让 `yes` 在后面的测试里继续占 CPU。
+    // 不管下面的断言成不成立，先关掉会话——别让刷屏命令在后面的测试里继续占 CPU。
     core.handle_inbound(&encode_envelope(&Envelope {
         kind: Some(envelope::Kind::Request(Request {
             id: 4,
@@ -301,7 +344,7 @@ fn read_thread_waits_for_low_water_before_resuming() {
 /// `sessions` 这个 map 里被 remove/drop 也不会让读线程的这份 `Arc` 失效。
 ///
 /// 复现思路：
-/// 1. 用 `yes` 把未确认字节数推过高水位，让读线程进入暂停自旋；
+/// 1. 用刷屏命令（`flood_command_bytes()`）把未确认字节数推过高水位，让读线程进入暂停自旋；
 /// 2. 确认此时活跃读线程数 >= 1（`live_read_threads()`）；
 /// 3. 发 `session.close`；
 /// 4. 轮询等待 `live_read_threads()` 降到 0，给足够宽松的超时（3s）——
@@ -325,7 +368,7 @@ fn closing_a_paused_session_terminates_its_read_thread() {
     std::thread::sleep(Duration::from_millis(1000));
 
     // 持续产出的命令：把未确认字节数推过高水位，让读线程进入暂停自旋。
-    core.write_data(&sid, b"yes\n");
+    core.write_data(&sid, flood_command_bytes());
 
     fn total_bytes_for(data: &Arc<Mutex<Vec<(String, Vec<u8>)>>>, sid: &str) -> u64 {
         data.lock()
@@ -343,7 +386,7 @@ fn closing_a_paused_session_terminates_its_read_thread() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "5s 内未能让输出越过高水位（{FLOW_HIGH_WATER_BYTES} 字节）——`yes` 是否真的在产出？"
+            "5s 内未能让输出越过高水位（{FLOW_HIGH_WATER_BYTES} 字节）——刷屏命令（flood_command_bytes()）是否真的在产出？"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -407,7 +450,7 @@ fn closing_a_paused_session_terminates_its_read_thread() {
 /// 前一条测试照样是绿的——这条测试专门堵这个盲区。
 ///
 /// 复现思路：
-/// 1. 用 `yes` 把未确认字节数推过高水位，记下此刻的累计字节数 n1；
+/// 1. 用刷屏命令（`flood_command_bytes()`）把未确认字节数推过高水位，记下此刻的累计字节数 n1；
 /// 2. ack 足够多，让未确认字节数降到**低水位以下**（而不是像负向测试那样只降到
 ///    低高水位中点）；
 /// 3. 等一小段时间；
@@ -421,7 +464,7 @@ fn read_thread_resumes_after_enough_ack() {
 
     std::thread::sleep(Duration::from_millis(1000));
 
-    core.write_data(&sid, b"yes\n");
+    core.write_data(&sid, flood_command_bytes());
 
     fn total_bytes_for(data: &Arc<Mutex<Vec<(String, Vec<u8>)>>>, sid: &str) -> u64 {
         data.lock()
@@ -439,7 +482,7 @@ fn read_thread_resumes_after_enough_ack() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "5s 内未能让输出越过高水位（{FLOW_HIGH_WATER_BYTES} 字节）——`yes` 是否真的在产出？"
+            "5s 内未能让输出越过高水位（{FLOW_HIGH_WATER_BYTES} 字节）——刷屏命令（flood_command_bytes()）是否真的在产出？"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -487,7 +530,7 @@ fn read_thread_resumes_after_enough_ack() {
     std::thread::sleep(Duration::from_millis(500));
     let n2 = total_bytes_for(&data, &sid);
 
-    // 不管断言成不成立，先关掉会话——别让 `yes` 占着 CPU。
+    // 不管断言成不成立，先关掉会话——别让刷屏命令占着 CPU。
     core.handle_inbound(&encode_envelope(&Envelope {
         kind: Some(envelope::Kind::Request(Request {
             id: 4,
@@ -500,7 +543,7 @@ fn read_thread_resumes_after_enough_ack() {
         n2 > n1 + FLOW_LOW_WATER_BYTES / 4,
         "ack 到 outstanding = {target_outstanding}（明显低于低水位 {FLOW_LOW_WATER_BYTES}）\
          之后等了 500ms，累计字节数只从 {n1} 长到 {n2}，涨幅不明显——读线程看起来没有\
-         真正恢复读 PTY。ack 够了以后读线程应该能继续大量产出（`yes` 的产出速度远高于\
+         真正恢复读 PTY。ack 够了以后读线程应该能继续大量产出（刷屏命令的产出速度远高于\
          这个涨幅门槛）。"
     );
 }
