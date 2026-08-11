@@ -1930,6 +1930,10 @@ git commit -m "test(bench): 压测工具与流控/批处理参数实测定值"
 
 ## Task 8: Windows ConPTY 验证
 
+> ⚠️ **下面的清单已作废，改用 `docs/superpowers/verification/win11-checklist.md`。**
+> 作废原因：本清单第 2/3/4 项要求起 CMD / WSL / Git Bash，但 `boot.ts` 里
+> `shell: ''` 写死、没有 shell 选择入口，这几项在当前构建上无法执行。
+
 **Files:**
 - Create: `docs/superpowers/verification/conpty.md`
 - 可能 Modify: `crates/ht-core/Cargo.toml`（换 portable-pty fork）
@@ -1978,6 +1982,11 @@ git commit -m "test(conpty): Windows ConPTY 验证记录"
 ---
 
 ## Task 9: 中文输入法、字体连字与崩溃隔离验证
+
+> ⚠️ **下面的清单已作废，改用 `docs/superpowers/verification/win11-checklist.md`。**
+> 作废原因：Step 3「崩溃隔离」整节不可执行——当前只有一个 BrowserWindow，
+> 没有 Tab，也没有「点击重开」UI 和核心自动重启逻辑；Step 2 第 5 项连字验证
+> 也不可执行，当前字体 Consolas 本身没有连字。
 
 **Files:**
 - Create: `docs/superpowers/verification/ime.md`, `font.md`, `crash-isolation.md`
