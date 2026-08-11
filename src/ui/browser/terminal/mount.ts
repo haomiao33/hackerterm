@@ -1,6 +1,8 @@
 import { Terminal, type ITheme } from '@xterm/xterm'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { FitAddon } from '@xterm/addon-fit'
+import { log } from '../diagnostics/log'
+import { createOnDataLogger } from '../diagnostics/byte-throttle'
 
 export interface TerminalHandle {
   write(bytes: Uint8Array): void
@@ -81,26 +83,42 @@ export function mountTerminal(el: HTMLElement, opts: MountOptions): TerminalHand
         // 连续丢失次数超过上限：多半是 GPU 驱动本身有问题，放弃重建，
         // 留在 DOM 渲染器上，避免无限递归重建抖动。
         if (contextLossCount >= MAX_WEBGL_CONTEXT_LOSS_RETRIES) {
-          console.warn(
-            `WebGL context lost ${contextLossCount + 1} times in a row, giving up and staying on DOM renderer`,
-          )
+          const msg = `WebGL context lost ${contextLossCount + 1} times in a row, giving up and staying on DOM renderer`
+          log(msg)
+          console.warn(msg)
           return
         }
         contextLossCount += 1
+        log(`WebGL context lost, retrying (${contextLossCount}/${MAX_WEBGL_CONTEXT_LOSS_RETRIES})`)
         attachWebgl() // 立刻尝试用新上下文重建，而不是永久退化成 DOM 渲染器
       })
       term.loadAddon(addon)
       webgl = addon
       contextLossCount = 0 // 重建成功说明 GPU 恢复正常了，之前的丢失记录作废
-    } catch {
+      log('WebGL renderer attached')
+    } catch (err) {
       webgl = undefined
-      console.warn('WebGL renderer unavailable, falling back to DOM renderer')
+      log(`WebGL renderer unavailable, falling back to DOM renderer: ${err}`)
+      console.warn('WebGL renderer unavailable, falling back to DOM renderer', err)
     }
   }
   attachWebgl()
 
   fit.fit()
+  log(`fit → ${term.cols} × ${term.rows}, container clientWidth×clientHeight = ${el.clientWidth}×${el.clientHeight}`)
   opts.onResize(term.cols, term.rows)
+
+  term.focus()
+  log(`term.focus() called, activeElement = ${document.activeElement?.tagName}`)
+
+  // 窗口重新拿到焦点（比如用户切回这个 Electron 窗口）时，把焦点带回终端的
+  // 辅助 textarea——否则用户会看到光标闪烁但键盘输入进不去，和真机报告的
+  // "看不见输入"现象同一类。
+  const onWindowFocus = (): void => {
+    term.focus()
+    log(`window focus → term.focus() called, activeElement = ${document.activeElement?.tagName}`)
+  }
+  window.addEventListener('focus', onWindowFocus)
 
   // --- 字体不糊之一：亮暗主题切换 ---
   const themeQuery = matchMedia('(prefers-color-scheme: dark)')
@@ -124,8 +142,18 @@ export function mountTerminal(el: HTMLElement, opts: MountOptions): TerminalHand
   registerDprWatcher()
 
   const enc = new TextEncoder()
-  term.onData((s) => opts.onInput(enc.encode(s)))
-  term.onResize(({ cols, rows }) => opts.onResize(cols, rows))
+  const logOnData = createOnDataLogger()
+  term.onData((s) => {
+    const bytes = enc.encode(s)
+    // 每次 onData 都记字节数 + hex 预览：这是回答"英文到底有没有发出去"
+    // 最直接的证据，比任何推理都可靠（节流规则见 byte-throttle.ts）。
+    logOnData(bytes)
+    opts.onInput(bytes)
+  })
+  term.onResize(({ cols, rows }) => {
+    log(`resize → ${cols} × ${rows}`)
+    opts.onResize(cols, rows)
+  })
 
   return {
     write(bytes) {
@@ -135,6 +163,7 @@ export function mountTerminal(el: HTMLElement, opts: MountOptions): TerminalHand
     dispose() {
       themeQuery.removeEventListener('change', onThemeChange)
       dprQuery.removeEventListener('change', onDprChange)
+      window.removeEventListener('focus', onWindowFocus)
       term.dispose()
     },
   }

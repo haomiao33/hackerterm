@@ -1,6 +1,8 @@
 import { ProtocolClient } from '../common/protocol/client'
 import { Hello, SessionAckRequest, SessionOpenRequest, SessionOpenResponse, SessionResizeRequest } from '../common/protocol/hackerterm'
 import { mountTerminal } from './terminal/mount'
+import { log } from './diagnostics/log'
+import { createIncomingDataLogger } from './diagnostics/byte-throttle'
 
 // preload 通过 contextBridge 暴露的唯一入口：请求给某个会话开一条数据通道。
 // 这是类型声明，不是 import 'electron'——ui/browser 仍然不依赖 Electron。
@@ -12,8 +14,6 @@ declare global {
   }
 }
 
-const log = (s: string) => { document.getElementById('log')!.textContent += `\n${s}` }
-
 /**
  * session.open 时先占位用的终端尺寸（列/行）。真实尺寸由 mountTerminal 里的
  * FitAddon 量出来后立刻通过 onResize -> session.resize 纠正，这两个数字
@@ -22,8 +22,12 @@ const log = (s: string) => { document.getElementById('log')!.textContent += `\n$
 const INITIAL_COLS = 80
 const INITIAL_ROWS = 24
 
+/** 诊断日志里 sessionId 只截前几位，够辨认又不占屏幕（日志区高度有限）。 */
+const SESSION_ID_LOG_PREFIX_LENGTH = 8
+
 window.addEventListener('message', (e) => {
   if (e.data?.kind !== 'port:control') return
+  log('control port ready')
   const port = e.ports[0]
   const client = new ProtocolClient({ send: (b) => port.postMessage(b) })
   port.onmessage = (m) => client.handleInbound(new Uint8Array(m.data))
@@ -47,11 +51,18 @@ function openSession(client: ProtocolClient): Promise<void> {
   const payload = SessionOpenRequest.encode({
     shell: '', cols: INITIAL_COLS, rows: INITIAL_ROWS, cwd: '',
   }).finish()
-  return client.request('session.open', payload).then((p) => {
-    const { sessionId } = SessionOpenResponse.decode(p)
-    waitForDataPort(sessionId, client)
-    window.ht.openDataPort(sessionId)
-  })
+  return client.request('session.open', payload)
+    .then((p) => {
+      const { sessionId } = SessionOpenResponse.decode(p)
+      log(`session.open → ${sessionId.slice(0, SESSION_ID_LOG_PREFIX_LENGTH)}…`)
+      waitForDataPort(sessionId, client)
+      window.ht.openDataPort(sessionId)
+    })
+    .catch((err) => {
+      // 单独 catch 而不是让错误冒泡到外层 hello 链上的 catch——否则 session.open
+      // 失败会被日志误标成 "handshake failed"，误导下一轮排障。
+      log(`session.open failed: ${err?.key ?? err}`)
+    })
 }
 
 /**
@@ -62,12 +73,16 @@ function openSession(client: ProtocolClient): Promise<void> {
 function waitForDataPort(sessionId: string, client: ProtocolClient): void {
   const onPort = (e: MessageEvent): void => {
     if (e.data?.kind !== 'port:data' || e.data.sessionId !== sessionId) return
+    // 这条时间戳和上面 session.open 返回的时间戳的差值，直接暴露数据面
+    // 启动的竞态窗口——两者本应背靠背，间隔越大越可疑。
+    log('data port ready')
     window.removeEventListener('message', onPort)
 
     const dataPort = e.ports[0]
     dataPort.start()
 
     const el = document.getElementById('terminal')!
+    const logIncoming = createIncomingDataLogger()
     const term = mountTerminal(el, {
       onInput(bytes) {
         // 直接 transfer 底层 ArrayBuffer：数据面不许转字符串、不许 JSON 序列化。
@@ -83,7 +98,11 @@ function waitForDataPort(sessionId: string, client: ProtocolClient): void {
       },
     })
 
-    dataPort.onmessage = (m) => term.write(new Uint8Array(m.data))
+    dataPort.onmessage = (m) => {
+      const bytes = new Uint8Array(m.data)
+      logIncoming(bytes.byteLength)
+      term.write(bytes)
+    }
   }
   window.addEventListener('message', onPort)
 }
