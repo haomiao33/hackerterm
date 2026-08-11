@@ -78,7 +78,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hackerterm-windows-x64
-          path: release/*.exe
+          # electron-builder 的 win target 从 portable 换成了 zip（见 package.json
+          # 的 build.win.target）：portable 每次启动都要把整个应用解压到 %TEMP%，
+          # 叠加 Windows Defender 对新解压文件的实时扫描，是 exe 启动要 20-30 秒的
+          # 根因。zip 产出解压即用的目录，用户只解压一次，之后直接跑里面的 exe，
+          # 省掉每次启动的解压步骤。产物文件名/glob 同步从 *.exe 换成 *.zip
+          # （命名规则仍由 build.win.artifactName 决定，只是 ${ext} 从 exe 变 zip）。
+          path: release/*.zip
           if-no-files-found: error
 
   # ────────────────────────────────────────────────────────────────
