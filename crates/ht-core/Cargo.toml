@@ -9,3 +9,4 @@ ht-proto = { path = "../ht-proto" }
 prost = "0.13"
 portable-pty = "0.8"
 uuid = { version = "1", features = ["v4"] }
+arrow = { version = "53", default-features = false, features = ["ipc"] }
