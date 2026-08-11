@@ -20,10 +20,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 不要在这里写 version —— package.json 已有 "packageManager": "pnpm@9.12.0"，
+      # 两处同时指定会让 pnpm/action-setup 直接报 ERR_PNPM_BAD_PM_VERSION 拒绝启动。
+      # 让它从 packageManager 读，版本只有一个事实来源。
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -98,10 +99,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 同 build job：版本只从 package.json 的 packageManager 读，不在这里重复指定。
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
-        with:
-          version: 9
 
       - name: Setup Node
         uses: actions/setup-node@v4
