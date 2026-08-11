@@ -124,3 +124,163 @@ fn closing_a_session_emits_exit_exactly_once() {
         "expected exactly one session.exit event, got {exit_count}"
     );
 }
+
+/// `session.ack` 是 Task 6 新增的 RPC 端点，之前零测试覆盖。
+/// 这条只验证路由是通的、返回的是成功响应而不是 Error——不涉及流控语义本身
+/// （流控语义见下面的 `read_thread_waits_for_low_water_before_resuming`）。
+#[test]
+fn session_ack_is_routed_without_error() {
+    let (ctrl, _data, core) = core_with_sink();
+    let sid = open_session(&core, &ctrl);
+    std::thread::sleep(Duration::from_millis(500));
+
+    core.handle_inbound(&encode_envelope(&Envelope {
+        kind: Some(envelope::Kind::Request(Request {
+            id: 2,
+            method: "session.ack".into(),
+            payload: ht_proto::pb::SessionAckRequest {
+                session_id: sid.clone(),
+                bytes_consumed: 4096,
+            }
+            .encode_to_vec(),
+        })),
+    }));
+
+    let out = ctrl.lock().unwrap();
+    let env = decode_envelope(out.last().expect("no response to session.ack")).unwrap();
+    let Some(envelope::Kind::Response(r)) = env.kind else {
+        panic!("expected a Response envelope for session.ack, got something else");
+    };
+    match r.result {
+        Some(response::Result::Payload(_)) => {} // success, as expected
+        Some(response::Result::Error(e)) => {
+            panic!(
+                "session.ack returned an error instead of success: code={:?} key={} detail={}",
+                e.code, e.key, e.detail
+            );
+        }
+        None => panic!("session.ack response had no result at all"),
+    }
+}
+
+/// 暴露 session.rs:94 的流控 bug：读线程暂停后应该等未确认字节数降到
+/// **低水位**（FLOW_LOW_WATER_BYTES）以下才恢复读 PTY（session.rs:91、
+/// limits.rs:27 的注释，以及 flow.rs `FlowWindow::new` 里 `assert!(low < high)`
+/// 存在的理由都这么写），但实际代码里读线程的自旋循环写的是
+/// `while read_flow.should_pause()`，只要未确认字节数一降回**高水位**以下
+/// 就会退出自旋、恢复读取——`should_resume()` 在生产代码里从未被调用过。
+///
+/// 复现思路：
+/// 1. 用 `yes` 让某个会话持续产出，把未确认字节数推过高水位；
+/// 2. 只 ack 一部分，让未确认字节数落在「低水位 < x < 高水位」这个区间——
+///    按文档，这个区间里读线程应该继续保持暂停；
+/// 3. 等一段远大于轮询间隔（`FLOW_PAUSE_POLL_INTERVAL_MS` = 2ms）的时间，
+///    看有没有新数据被读出来。有，就说明它错误地恢复了。
+///
+/// 高低水位阈值都从 `ht_core::limits` 读，不写死字面量——Task 7 压测会调它们。
+#[test]
+fn read_thread_waits_for_low_water_before_resuming() {
+    use ht_core::limits::{FLOW_HIGH_WATER_BYTES, FLOW_LOW_WATER_BYTES};
+
+    let (ctrl, data, core) = core_with_sink();
+    let sid = open_session(&core, &ctrl);
+
+    // 等 shell 就绪，跟其它 session 测试里用的经验值一致。
+    std::thread::sleep(Duration::from_millis(1000));
+
+    // 持续产出的命令：把未确认字节数推过高水位。
+    core.write_data(&sid, b"yes\n");
+
+    fn total_bytes_for(data: &Arc<Mutex<Vec<(String, Vec<u8>)>>>, sid: &str) -> u64 {
+        data.lock()
+            .unwrap()
+            .iter()
+            .filter(|(s, _)| s == sid)
+            .map(|(_, b)| b.len() as u64)
+            .sum()
+    }
+
+    // 未确认字节数 == 迄今为止通过数据通道收到的总字节数，因为这个会话
+    // 从开始到现在还没有被 ack 过。等它越过高水位。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if total_bytes_for(&data, &sid) >= FLOW_HIGH_WATER_BYTES {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "5s 内未能让输出越过高水位（{FLOW_HIGH_WATER_BYTES} 字节）——`yes` 是否真的在产出？"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 稳定化：此刻读线程应该已经卡在暂停自旋里（不管 bug 存在与否，暂停触发条件
+    // 本身没问题），总字节数应该不再增长。用「连续两次相隔 50ms 的读数相等」
+    // 代替固定 sleep，避免测量到还在增长的过渡期，读数更确定。
+    let mut n1 = total_bytes_for(&data, &sid);
+    let stabilize_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let now = total_bytes_for(&data, &sid);
+        if now == n1 {
+            break;
+        }
+        n1 = now;
+        assert!(
+            std::time::Instant::now() < stabilize_deadline,
+            "2s 内读线程一直没有停止产出，说明连高水位暂停本身都没生效——\
+             这比我们要找的 bug 更严重，先别往下走了"
+        );
+    }
+
+    // 只 ack 一部分，把未确认字节数降到「低水位 < x < 高水位」区间的中点——
+    // 按文档，这个区间里读线程应该继续保持暂停，直到降破低水位。
+    let target_outstanding = (FLOW_HIGH_WATER_BYTES + FLOW_LOW_WATER_BYTES) / 2;
+    assert!(
+        target_outstanding > FLOW_LOW_WATER_BYTES && target_outstanding < FLOW_HIGH_WATER_BYTES,
+        "水位中点没有落在低高水位之间，测试前提不成立（检查 limits.rs 里的水位定义）"
+    );
+    assert!(
+        n1 > target_outstanding,
+        "总字节数 {n1} 应该已经超过中点 {target_outstanding}（前面已经等它越过了高水位 {FLOW_HIGH_WATER_BYTES}）"
+    );
+    let ack_amount = n1 - target_outstanding;
+
+    core.handle_inbound(&encode_envelope(&Envelope {
+        kind: Some(envelope::Kind::Request(Request {
+            id: 3,
+            method: "session.ack".into(),
+            payload: ht_proto::pb::SessionAckRequest {
+                session_id: sid.clone(),
+                bytes_consumed: ack_amount,
+            }
+            .encode_to_vec(),
+        })),
+    }));
+
+    // 轮询间隔是 2ms（FLOW_PAUSE_POLL_INTERVAL_MS）：500ms 远够让「正确实现」
+    // 稳稳地停在暂停态，也远够让「有 bug 的实现」明显恢复读取并吐出大量新数据
+    // （`yes` 吐字节的速度远高于 500ms 内几 KB 的量级）。
+    std::thread::sleep(Duration::from_millis(500));
+    let n2 = total_bytes_for(&data, &sid);
+
+    // 不管下面的断言成不成立，先关掉会话——别让 `yes` 在后面的测试里继续占 CPU。
+    core.handle_inbound(&encode_envelope(&Envelope {
+        kind: Some(envelope::Kind::Request(Request {
+            id: 4,
+            method: "session.close".into(),
+            payload: ht_proto::pb::SessionCloseRequest { session_id: sid.clone() }.encode_to_vec(),
+        })),
+    }));
+
+    assert_eq!(
+        n2, n1,
+        "未确认字节数被 ack 降到 {target_outstanding}（低水位 {FLOW_LOW_WATER_BYTES} < x < 高水位 \
+         {FLOW_HIGH_WATER_BYTES}，按文档应该继续暂停）之后，读线程又多产出了 {} 字节——\
+         说明它只等 outstanding 降回高水位以下（should_pause() 变 false）就恢复读 PTY 了，\
+         而不是像注释承诺的那样等到 should_resume()（降破低水位）。这正是 \
+         session.rs:94 `while read_flow.should_pause()` 的已知缺陷：should_resume() \
+         在生产代码里从未被调用。",
+        n2.saturating_sub(n1)
+    );
+}
