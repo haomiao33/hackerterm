@@ -65,6 +65,10 @@ export function mountTerminal(el: HTMLElement, opts: MountOptions): TerminalHand
   term.open(el)
 
   let webgl: WebglAddon | undefined
+  // 连续丢失次数：每次 attachWebgl() 成功重建就清零，所以量的是"连续"而不是
+  // 全生命周期累计——否则笔记本每天睡眠唤醒一次，三天后就会被误判成 GPU 驱动
+  // 故障，永久降级到 DOM 渲染器（睡眠唤醒本来就是 onContextLoss 的典型触发场景，
+  // 不该被当成故障累计）。
   let contextLossCount = 0
 
   // WebGL 失败要降级而不是白屏（产品文档 §17 承诺③）。
@@ -87,6 +91,7 @@ export function mountTerminal(el: HTMLElement, opts: MountOptions): TerminalHand
       })
       term.loadAddon(addon)
       webgl = addon
+      contextLossCount = 0 // 重建成功说明 GPU 恢复正常了，之前的丢失记录作废
     } catch {
       webgl = undefined
       console.warn('WebGL renderer unavailable, falling back to DOM renderer')
