@@ -1,5 +1,8 @@
 import { ProtocolClient } from '../common/protocol/client'
-import { Hello, SessionAckRequest, SessionOpenRequest, SessionOpenResponse, SessionResizeRequest } from '../common/protocol/hackerterm'
+import {
+  Hello, SessionAckRequest, SessionExitEvent, SessionOpenRequest, SessionOpenResponse,
+  SessionResizeRequest, SessionState, SessionStateEvent,
+} from '../common/protocol/hackerterm'
 import { mountTerminal } from './terminal/mount'
 import { log } from './diagnostics/log'
 import { createIncomingDataLogger } from './diagnostics/byte-throttle'
@@ -40,6 +43,23 @@ window.addEventListener('message', (e) => {
   const client = new ProtocolClient({ send: (b) => port.postMessage(b) })
   port.onmessage = (m) => client.handleInbound(new Uint8Array(m.data))
   port.start()
+
+  // session.exit / session.state 是核心主动推的事件（不是请求-响应），随时可能
+  // 到达，订阅要趁早——挂在 hello 握手之前，不然握手期间/之前发生的事件会被
+  // 未知 topic 静默丢弃（见 ProtocolClient.handleInbound 的丢弃逻辑）。
+  // session.state 是这轮新增的：读线程停止（干净 EOF 或真错误）之前完全不
+  // 上报，渲染层只能看到"数据永久不再来"却不知道为什么；现在核心会把这个
+  // 状态经这个事件报出来。
+  client.on('session.exit', (payload) => {
+    const { sessionId, exitCode } = SessionExitEvent.decode(payload)
+    log(`session.exit ← ${sessionId.slice(0, SESSION_ID_LOG_PREFIX_LENGTH)}… exitCode=${exitCode}`)
+  })
+  client.on('session.state', (payload) => {
+    const ev = SessionStateEvent.decode(payload)
+    const stateName = SessionState[ev.state] ?? `unknown(${ev.state})`
+    const errorSuffix = ev.error ? ` error=${ev.error.key}: ${ev.error.detail}` : ''
+    log(`session.state ← ${ev.sessionId.slice(0, SESSION_ID_LOG_PREFIX_LENGTH)}… state=${stateName}${errorSuffix}`)
+  })
 
   const payload = Hello.encode({
     protocolMajor: 1, protocolMinor: 0, minSupportedMajor: 1,

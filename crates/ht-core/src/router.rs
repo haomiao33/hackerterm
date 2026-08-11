@@ -32,9 +32,38 @@ impl Core {
                         .encode_to_vec();
                     out("session.exit", payload);
                 });
+                // 读线程停止（干净 EOF 或真错误）跟子进程退出是两件不同的事——读线程
+                // 可能在子进程还活着的时候就先死了（比如管道读错误），这种情况下
+                // session.exit 永远不会发，渲染层只会看到数据永久停止、毫无解释。
+                // 这里把 crate::session::ReadStopReason 映射成已有的
+                // SessionStateEvent（Closed/Failed），复用现成的协议消息，不需要
+                // 改 proto/ 里的 schema。
+                let out_for_state = self.outbound_clone_for_events();
+                let on_read_stopped = Arc::new(move |sid: String, reason: crate::session::ReadStopReason| {
+                    let (state, error) = match reason {
+                        crate::session::ReadStopReason::Eof => {
+                            (ht_proto::pb::SessionState::Closed, None)
+                        }
+                        crate::session::ReadStopReason::Error(detail) => (
+                            ht_proto::pb::SessionState::Failed,
+                            Some(dispatch::err(
+                                ht_proto::pb::ErrorCode::Internal,
+                                "err.session.read_stopped",
+                                detail,
+                            )),
+                        ),
+                    };
+                    let payload = ht_proto::pb::SessionStateEvent {
+                        session_id: sid,
+                        state: state as i32,
+                        error,
+                    }
+                    .encode_to_vec();
+                    out_for_state("session.state", payload);
+                });
                 let id = self
                     .sessions
-                    .open(&r.shell, r.cols as u16, r.rows as u16, &r.cwd, on_exit)
+                    .open(&r.shell, r.cols as u16, r.rows as u16, &r.cwd, on_exit, on_read_stopped)
                     .map_err(|e| dispatch::err(ht_proto::pb::ErrorCode::ConnectFailed,
                                                "err.session.open_failed", e.to_string()))?;
                 Ok(SessionOpenResponse { session_id: id }.encode_to_vec())

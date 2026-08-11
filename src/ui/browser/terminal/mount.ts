@@ -35,8 +35,26 @@ const MAX_WEBGL_CONTEXT_LOSS_RETRIES = 3
 
 // 亮/暗两套主题的取值本身不是本任务重点（暂定值，等设计稿定稿后替换）；
 // 重点是切换时必须连同 WebGL 纹理图集一起清空，见下面 applyTheme。
-const LIGHT_THEME: ITheme = { background: '#ffffff', foreground: '#1e1e1e' }
-const DARK_THEME: ITheme = { background: '#1e1e1e', foreground: '#d4d4d4' }
+//
+// cursor / cursorAccent 必须显式给：ITheme 不设这两项时，xterm.js 内部会
+// 退回一个写死的默认色，跟我们亮色主题的白色背景太接近，导致光标"淡出"到
+// 肉眼看不见（无头 Chromium 截图实测：亮色主题下提示符后面完全看不到光标，
+// 切到暗色主题——同样没显式设置 cursor——光标立刻清晰可见，证实不是渲染
+// 管线的 bug，是这两套主题各自缺 cursor 配色）。取前景色当光标色、背景色
+// 当 cursorAccent（光标下面字符的颜色），跟 background/foreground 反相，
+// 保证光标在两套主题下都跟背景有足够对比度。
+const LIGHT_THEME: ITheme = {
+  background: '#ffffff',
+  foreground: '#1e1e1e',
+  cursor: '#1e1e1e',
+  cursorAccent: '#ffffff',
+}
+const DARK_THEME: ITheme = {
+  background: '#1e1e1e',
+  foreground: '#d4d4d4',
+  cursor: '#d4d4d4',
+  cursorAccent: '#1e1e1e',
+}
 
 function themeFor(prefersDark: boolean): ITheme {
   return prefersDark ? DARK_THEME : LIGHT_THEME

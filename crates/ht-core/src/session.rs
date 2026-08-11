@@ -7,6 +7,17 @@ use std::sync::{Arc, Mutex};
 
 pub type DataOut = Arc<dyn Fn(String, Vec<u8>) + Send + Sync>;
 
+/// 读线程停止的原因。读线程一旦停止，这个会话往后就再也不会有新数据流回渲染层——
+/// 之前这个事件完全没人知道（`Ok(0) | Err(_) => break` 静默退出，连日志都没有），
+/// 真机排障时只能看见"没有数据"这一个症状，猜不出是干净结束还是出错了。
+/// 两种情况区分开上报，让上层（router.rs）能分别映射成
+/// `SessionState::Closed`（Eof，PTY 从端正常关闭，比如子进程退出前先关了自己的
+/// 输出）和 `SessionState::Failed`（Error，携带具体错误信息，真正的异常）。
+pub enum ReadStopReason {
+    Eof,
+    Error(String),
+}
+
 pub struct Session {
     pub id: String,
     pair: PtyPair,
@@ -56,6 +67,7 @@ impl SessionManager {
         rows: u16,
         cwd: &str,
         on_exit: Arc<dyn Fn(String, i32) + Send + Sync>,
+        on_read_stopped: Arc<dyn Fn(String, ReadStopReason) + Send + Sync>,
     ) -> std::io::Result<String> {
         let sys = NativePtySystem::default();
         let pair = sys
@@ -95,6 +107,7 @@ impl SessionManager {
         let data_out = self.data_out.clone();
         let read_id = id.clone();
         let read_flow = flow.clone();
+        let read_stop_id = id.clone();
         self.live_read_threads.fetch_add(1, Ordering::SeqCst);
         let live_read_threads = self.live_read_threads.clone();
         std::thread::spawn(move || {
@@ -123,7 +136,28 @@ impl SessionManager {
                     }
                 }
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    // `Read::read` 的文档契约：`ErrorKind::Interrupted` 不是真错误，
+                    // 调用方应当重试。之前这里把它和真错误混在一起直接 break，
+                    // 一次被信号打断的无害系统调用就会被误判成"读线程该退出了"，
+                    // 之后这个会话的 PTY 输出永久停止、且完全没有任何日志。
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // 干净 EOF：PTY 从端正常关闭（通常是子进程退出前先关了自己的
+                    // 输出端）。这不是错误，但同样要通知上层——不然渲染层只会看到
+                    // "数据永远不再来"，猜不出会话已经结束了。
+                    Ok(0) => {
+                        on_read_stopped(read_stop_id.clone(), ReadStopReason::Eof);
+                        break;
+                    }
+                    // 真正的读错误：把 `ErrorKind` + 原始错误信息都带出去，这是目前
+                    // 唯一能回答"读线程到底为什么停了"的证据来源——之前这个分支
+                    // 完全静默，真机排障时只能干瞪眼。
+                    Err(e) => {
+                        on_read_stopped(
+                            read_stop_id.clone(),
+                            ReadStopReason::Error(format!("{:?}: {e}", e.kind())),
+                        );
+                        break;
+                    }
                     Ok(n) => {
                         data_out(read_id.clone(), buf[..n].to_vec());
                         read_flow.on_sent(n as u64);
