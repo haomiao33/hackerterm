@@ -3,3 +3,7 @@ node_modules/
 target/
 *.node
 out/
+# 时延测量的原始输出（.github/workflows/build.yml 的 latency-windows job 会在
+# 工作区根目录生成这两个文件；本地照着跑一遍也会）。是测量产物，不入库。
+latency-conpty.log
+latency-full.log

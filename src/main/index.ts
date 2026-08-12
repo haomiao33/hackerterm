@@ -102,31 +102,116 @@ ipcMain.on('open-data-port', (event, sessionId: string) => {
 })
 
 /**
- * 把 GPU 各特性的启用/禁用状态打进同一条启动时间线。
+ * 取值稳定判据：距离上一次 `gpu-info-update` 超过这么久没有新事件，就认为
+ * GPU 信息收敛了，取当前值。
+ *
+ * 为什么要靠"静默一段时间"而不是等某个"最终"事件：Electron 没有这样的事件。
+ * 官方文档对 `gpu-info-update` 的全部说明只有一句"Emitted whenever there is a
+ * GPU info update"，electron#30827 也确认了它在一次启动里会触发多次、且没有
+ * 任何办法知道哪一次是最后一次。所以只能取"不再变了"作为收敛判据。
+ */
+const GPU_STATUS_SETTLE_MS = 1000
+/**
+ * 兜底上限：从开始监听算起这么久之后无条件收口。
+ *
+ * 存在的意义是保证日志区**一定**会出现一条 GPU 结论——要么是真值，要么是
+ * 白纸黑字的"未获取到"。悬而不决比错值好，但"什么都不写"比两者都糟：下一轮
+ * 排查的人会以为这条埋点没生效。
+ */
+const GPU_STATUS_DEADLINE_MS = 15_000
+
+function formatGpuFeatureStatus(status: Electron.GPUFeatureStatus): string {
+  return Object.entries(status).map(([feature, state]) => `${feature}=${state}`).join(' ')
+}
+
+/**
+ * 把 GPU 各特性的启用/禁用状态打进同一条启动时间线——**等它真的可用之后再读**。
  *
  * 排查冷启动慢的时候我们对 GPU 状态两眼一抹黑，只能靠反复加 `--disable-gpu`
  * 重启做对照实验；这一条直接把"硬件加速到底开没开、哪几项被禁"写进用户能
  * 截图带回来的日志区。终端是整屏重绘的场景，WebGL 有没有真的生效对观感的
  * 影响是数量级的。
  *
- * 放在 createWindow() 之后调用：这个 API 读的是 Chromium 已有的
- * GpuFeatureInfo，正常是纯读取，但万一它要等 GPU 进程先就绪，也绝不能挡在
- * 建窗口前面（那等于把本轮省下来的时间又赔回去）。前后各记一个时间点，真被
- * 它卡住的话时间线上一眼就能看出来。
+ * ── 为什么改掉原来那种 "whenReady 之后立刻读一次" 的写法 ──────────────
+ * 原写法在 `app.whenReady()` 后 13ms 就调 `app.getGPUFeatureStatus()`，那时
+ * GPU 进程还没初始化完，读到的是 Chromium 的初始占位值。真机日志实证：它报
+ * `webgl=disabled_off`，可同一份日志里 +914ms 就打出了 `WebGL renderer
+ * attached`——WebGL 明明是好的。**错的诊断信息比没有诊断信息更糟**，它会把
+ * 下一轮排查直接带沟里。
+ *
+ * Electron 文档在 `app.getGPUFeatureStatus()` 条目下写得很明确：
+ * "This information is only usable after the `gpu-info-update` event is
+ * emitted."（https://www.electronjs.org/docs/latest/api/app）所以正确时机就是
+ * 这个事件，而不是 app ready。
+ *
+ * ── 为什么不是"第一次 gpu-info-update 就取值" ────────────────────────
+ * 这个事件一次启动会触发多次（electron#30827），第一次触发时信息往往还只填了
+ * 一部分。这里改成：每次事件都重读一遍，直到连续 GPU_STATUS_SETTLE_MS 没有
+ * 新事件才落笔；同时把"一共更新了几次、其中取值真的变过几次"一并记进日志——
+ * 这两个数字正是判断"是不是又读早了"的直接证据，下一轮不用再猜。
+ *
+ * ── 不阻塞启动 ──────────────────────────────────────────────────────
+ * 全程只有事件回调和定时器，没有任何同步等待，主进程该干什么干什么。原实现
+ * 那对 `gpu_status_start/end` 埋点（实测 2ms）改成 `gpu_status_wait_start`
+ * → `main:gpu_status_first_update` → `main:gpu_status_end`，时间线上能直接看出
+ * "GPU 信息是启动后多久才可用的"，这本身就是排查冷启动要的信息。
+ *
+ * 定时器不 unref：Electron 主进程的存活由 app.quit / window-all-closed 决定，
+ * 不由 libuv 事件循环空不空决定，挂着一个定时器既不会拖住退出，也不会因为
+ * 循环空了就不触发。
  */
-function recordGpuFeatureStatus(): void {
-  timing.record('main:gpu_status_start')
-  const status = app.getGPUFeatureStatus()
-  timing.record('main:gpu_status_end')
-  timing.note(
-    'main:gpu_feature_status',
-    Object.entries(status).map(([feature, state]) => `${feature}=${state}`).join(' '),
-  )
+function watchGpuFeatureStatus(): void {
+  timing.record('main:gpu_status_wait_start')
+
+  let updates = 0
+  let valueChanges = 0
+  let latest: string | null = null
+  let settleTimer: NodeJS.Timeout | null = null
+  let deadlineTimer: NodeJS.Timeout | null = null
+  let finished = false
+
+  function finish(text: string): void {
+    if (finished) return
+    finished = true
+    if (settleTimer) clearTimeout(settleTimer)
+    if (deadlineTimer) clearTimeout(deadlineTimer)
+    app.off('gpu-info-update', onGpuInfoUpdate)
+    timing.record('main:gpu_status_end')
+    timing.note('main:gpu_feature_status', text)
+  }
+
+  function onGpuInfoUpdate(): void {
+    updates += 1
+    const text = formatGpuFeatureStatus(app.getGPUFeatureStatus())
+    if (latest !== null && text !== latest) valueChanges += 1
+    latest = text
+    if (updates === 1) timing.record('main:gpu_status_first_update')
+
+    if (settleTimer) clearTimeout(settleTimer)
+    settleTimer = setTimeout(() => {
+      finish(`${latest} (gpu-info-update ×${updates}, 取值变化 ${valueChanges} 次, 静默 ${GPU_STATUS_SETTLE_MS}ms 后收敛)`)
+    }, GPU_STATUS_SETTLE_MS)
+  }
+
+  deadlineTimer = setTimeout(() => {
+    // 拿不到就明说拿不到。绝不能退回去读一次 getGPUFeatureStatus() 充数——
+    // 那读回来的正是本次修复要消灭的那个假状态。
+    finish(latest === null
+      ? `未获取到：${GPU_STATUS_DEADLINE_MS}ms 内 gpu-info-update 一次都没触发，GPU 状态未知（注意：这不等于"全部禁用"）`
+      : `${latest} (gpu-info-update ×${updates}, 取值变化 ${valueChanges} 次, ${GPU_STATUS_DEADLINE_MS}ms 上限到达时仍在更新, 取当时值)`)
+  }, GPU_STATUS_DEADLINE_MS)
+
+  app.on('gpu-info-update', onGpuInfoUpdate)
 }
+
+// 在 app ready **之前**就把监听挂上：`gpu-info-update` 由 GPU 进程初始化推动，
+// 它和 ready 谁先谁后没有任何保证，等进了 whenReady 回调再挂就可能漏掉第一次
+// 触发（而漏掉第一次会让"更新了几次"这个诊断数字也跟着失真）。app 对象在模块
+// 加载阶段就能挂监听，没有理由再等。
+watchGpuFeatureStatus()
 
 app.whenReady().then(() => {
   timing.record('main:app_whenReady')
   spawnCore()
   createWindow()
-  recordGpuFeatureStatus()
 })

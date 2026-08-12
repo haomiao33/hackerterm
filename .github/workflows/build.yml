@@ -107,9 +107,8 @@ jobs:
   #    与操作系统无关，Linux 上一样能抓——已经用"把那行 postMessage 退回
   #    有 bug 的写法"实测验证过测试会变红。
   # 2. Linux runner 比 Windows runner 快且便宜，冒烟测试要跑得勤。
-  # 后续可以再加一个 Windows 冒烟 job（那边走 ConPTY，能额外覆盖
-  # crates/ht-core/src/session.rs 里 Windows 专有的那条路径）；目前没加，是因为
-  # 本轮没有 Windows 环境可以实测，不想往 CI 里塞一个没验证过的 job。
+  # 它的**盲区**由下面新增的 smoke-windows 补上（ConPTY 专有路径 + 在 Linux 上
+  # 只能跳过的那条"命令输出"断言）。两个平台各跑一份，不是重复劳动。
   # ────────────────────────────────────────────────────────────────
   smoke:
     name: smoke e2e (linux, 键盘 → PTY → 屏幕)
@@ -172,6 +171,240 @@ jobs:
       # xvfb-run -a：自动挑一个没被占用的 display 号。
       - name: E2E smoke (Playwright + real Electron + real PTY)
         run: xvfb-run -a pnpm test:e2e
+
+  # ────────────────────────────────────────────────────────────────
+  # smoke-windows：同一套端到端冒烟，跑在产品的**正式目标平台**上。
+  #
+  # 为什么值得再跑一遍（不是重复上面的 smoke）：
+  # 1. e2e/smoke.e2e.ts 里第二条断言「命令真的执行了：屏幕上出现 hello」
+  #    在 Linux 上是**跳过**的——portable-pty 在 fork 之后 exec 之前调
+  #    close_random_fds()，撞上 Chromium 覆盖过的 close() 的 fd 归属检查，
+  #    子进程直接 IMMEDIATE_CRASH，shell 从来没起来。Windows 走 ConPTY，
+  #    根本没有 fork/close-fds 这一段，那条断言在这里是**活的**。
+  #    也就是说，"shell 真的在 Electron 进程里跑起来了"这件事，只有这个
+  #    job 能验证。
+  # 2. 顺带覆盖 crates/ht-core/src/session.rs 里 Windows 专有的 ConPTY 分支
+  #    和默认 shell（powershell.exe）路径。
+  #
+  # 【硬门禁，不加 continue-on-error】理由：
+  # 这条链路正是连着两天没跑通 demo 的那条，而 Windows 是用户实际会跑的平台。
+  # 它红了 = 用户手里的 exe 大概率也是坏的，必须立刻有人知道。verify job 那种
+  # "预期会红、大家约定忽略" 的定位对它完全不适用（verify 是可移植性探针，
+  # 这个是红绿灯）。同时它不设 needs: build，与 build 并行——build 是用户下载
+  # 安装包的唯一来源，产物路径 release/*.zip 一个字都没动，冒烟红不拦出包。
+  #
+  # 【关于 windows-latest 能不能跑 Electron GUI —— 查到的依据】
+  # 这是本 job 最大的未知数，所以查了官方/上游一手材料而不是猜：
+  # - Playwright **自己的 CI** 就在 windows-latest 上跑 Electron 测试。见
+  #   microsoft/playwright 的 .github/workflows/tests_secondary.yml 里
+  #   `test_electron` job：`matrix.os: [ubuntu-latest, macos-latest,
+  #   windows-latest]`。配套的 .github/actions/run-test/action.yml 里，只有
+  #   `if [[ "$(uname)" == "Linux" ]]` 那一支才套 xvfb-run，Windows 分支是
+  #   **直接跑命令、不做任何显示相关的准备**。这是"windows-latest 上
+  #   `_electron.launch()` 能用"最硬的一手证据：上游拿它当回归测试在跑。
+  # - Playwright 官方 CI 文档（https://playwright.dev/docs/ci）也只对 Linux
+  #   提出了 "headed execution requires Xvfb" 的要求，Windows/macOS agent
+  #   没有额外配置要求。
+  # - 原理上说得通：Playwright 的 Electron 模式通过 CDP 驱动页面，
+  #   page.keyboard 走的是 Input.dispatchKeyEvent，**不需要**操作系统层面
+  #   的窗口焦点或可见桌面。这也是为什么它不受 Windows Session 0 隔离
+  #   （服务进程拿不到交互式桌面）的影响，而 WinAppDriver 那类真·桌面 UI
+  #   自动化在 GitHub 托管 runner 上就是不行——两者不是一回事，别拿后者的
+  #   失败案例推断前者。
+  #
+  # 【已知坑，写在这里免得下次重新踩】
+  # - 没有 GPU：runner 是无显卡虚拟机，Chromium 走软件渲染，xterm 的 WebGL
+  #   addon 很可能起不来。这**不影响**本 job：src/ui/browser/terminal/mount.ts
+  #   已经做了 WebGL 失败退回 DOM 渲染器的降级，屏幕缓冲区照样有内容，而所有
+  #   断言读的都是缓冲区不是像素。
+  # - electron#47419：Electron 36.x 上 `_electron.launch()` 会
+  #   "Process failed to launch!"。本仓库钉的是 electron ^43.3.0，不在受影响
+  #   区间；而且该 issue 里报的失败集中在 Linux CI，Windows runner 未受影响。
+  #   升级 Electron 大版本时值得回头看一眼这个 issue。
+  # - 超时：Windows runner 冷启动 + Defender 实时扫描比 Linux 慢得多。
+  #   e2e 侧已有 MOUNT_TIMEOUT_MS=60s / testTimeout=120s 的余量，job 级再兜一层
+  #   timeout-minutes，免得挂死占满 6 小时默认上限。
+  # ────────────────────────────────────────────────────────────────
+  smoke-windows:
+    name: smoke e2e (windows, ConPTY + 真 shell)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 build job：版本只从 package.json 的 packageManager 读。
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+
+      # 同 build job：prost-build 不自带 protoc。
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # shell: bash 显式声明——windows runner 的默认 shell 是 pwsh，下面这段
+      # 用的是 POSIX 循环语法。GitHub 的 windows 镜像自带 Git Bash，可以直接用。
+      - name: Install dependencies (pnpm install, retry x3)
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            pnpm install --frozen-lockfile && exit 0
+            echo "pnpm install failed (attempt $i/3), retrying in 5s..."
+            sleep 5
+          done
+          echo "pnpm install failed after 3 attempts"
+          exit 1
+
+      # 跑的是**真实构建产物**，这两步缺一不可。
+      - name: Build native module (napi-rs)
+        run: pnpm build:native
+
+      - name: Build Electron app
+        run: pnpm build
+
+      # 不套 xvfb：Windows 有原生窗口系统，scripts/run-e2e.mjs 里那层包装的判据
+      # 就是「Linux 且没有 DISPLAY」，在这里自然不会触发，直接跑 vitest。
+      - name: E2E smoke (Playwright + real Electron + ConPTY + real shell)
+        run: pnpm test:e2e
+
+  # ────────────────────────────────────────────────────────────────
+  # latency-windows：把「键盘 → PTY → 屏幕」的时延分段测量搬到 CI，
+  # 结果直接写进 Actions 的**运行摘要页**。
+  #
+  # 为什么必须搬到 CI：用户只下载打包好的 zip，本机没有 Node / Rust / pnpm，
+  # `pnpm measure:latency` 他跑不了。摘要页是唯一一个"点开就能读、不用下载
+  # 任何东西"的位置，所以产出落在 $GITHUB_STEP_SUMMARY，而不是 artifact。
+  #
+  # 跑两组测量：
+  # 1. crates/ht-core/examples/pty_latency.rs —— 纯 Rust + ConPTY，不含
+  #    napi / MessagePort / xterm。这是"ConPTY 自己要多久"的基准线。
+  # 2. pnpm measure:latency —— 完整 Electron 链路，输出 PTY / NAPI / FULL 三段。
+  # 摘要页把两组数字和它们的比值排成表格，回答那个真正的问题：
+  # **键盘往返总时延里，ConPTY 自己占多少，我们的 IPC + 渲染占多少。**
+  #
+  # 【不当门禁：continue-on-error 加在"测量"那几步上，不加在 job 上】理由：
+  # 这个 job 是**测量**，不是**判定**。没有阈值可判——runner 的绝对毫秒数
+  # 不可外推到用户真机（无 GPU、共享 vCPU 的 Windows Server 虚拟机），拿它
+  # 设红线只会制造一堆没人能处理的假警报。它的价值全部在摘要页那张表上，
+  # 表在就行，红绿灯留给 smoke-windows。
+  # 但也不是"整个 job 一律不红"：continue-on-error 只挂在构建和两步测量上，
+  # checkout / setup / pnpm install 这些**基础设施**步骤照常能把 job 弄红——
+  # 那类失败说明 CI 配置本身坏了，是必须有人去修的，不该被一起消音。
+  # 注意它和 verify 的定位**不一样**：verify 是"预期会红"的探针，这个是
+  # "预期会绿、但红了不拦人"。所以没有把它塞进 verify——塞进去，摘要页里
+  # 这张表就会淹没在一堆预期失败里，没人再当回事。
+  # 摘要那一步挂 if: always()，测量挂了也照样写一页说明（而不是一片空白）。
+  # ────────────────────────────────────────────────────────────────
+  latency-windows:
+    name: latency (windows, ConPTY vs 我们的 IPC)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies (pnpm install, retry x3)
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            pnpm install --frozen-lockfile && exit 0
+            echo "pnpm install failed (attempt $i/3), retrying in 5s..."
+            sleep 5
+          done
+          echo "pnpm install failed after 3 attempts"
+          exit 1
+
+      # 时延测量跑的同样是真实构建产物（out/ + 真 .node），顺带也把 ht-core 的
+      # release 产物预热进 cargo target 里，下面那个 example 就不用从头编。
+      - name: Build native module (napi-rs)
+        continue-on-error: true
+        run: pnpm build:native
+
+      - name: Build Electron app
+        continue-on-error: true
+        run: pnpm build
+
+      # ConPTY 基准线：同一个 example 连跑 3 轮，样本合池到一个日志里。
+      # 为什么跑 3 轮：单轮 n=60 时 p95 只由最靠上的 3 个样本决定，在共享 CPU 的
+      # runner 上那 3 个样本基本是噪声。单轮只要两三秒，多跑几轮把 n 抬到 180，
+      # p95 才勉强说得上有意义。（不改 example 里的 SAMPLES 常量——本轮不动
+      # crates/ 下的既有代码，多跑几遍在外面合池是等价且零侵入的做法。）
+      - name: Measure ConPTY roundtrip (纯 Rust, ×3)
+        continue-on-error: true
+        shell: bash
+        run: |
+          : > latency-conpty.log
+          for i in 1 2 3; do
+            echo "── run $i/3 ──"
+            cargo run -p ht-core --release --example pty_latency 2>&1 | tee -a latency-conpty.log
+          done
+
+      # 完整链路。tee 一份到文件供下面生成摘要，同时原样留在 job 日志里，
+      # 摘要上的数字随时可以回来对账。
+      # 注：GitHub 的 `shell: bash` 默认带 `-eo pipefail`，管道里 pnpm 挂了这一步
+      # 就会红（然后被 continue-on-error 接住），不会出现"测量失败但步骤是绿的"。
+      - name: Measure full Electron chain (pnpm measure:latency)
+        continue-on-error: true
+        shell: bash
+        run: pnpm measure:latency 2>&1 | tee latency-full.log
+
+      # 摘要页。if: always() —— 上面任何一步挂了，这里也要写一页出来，
+      # 明确告诉读者哪一节"未测到"，而不是留一片空白让人以为埋点没生效。
+      - name: Write latency summary to run page
+        if: always()
+        shell: bash
+        run: node scripts/latency-summary.mjs latency-conpty.log latency-full.log >> "$GITHUB_STEP_SUMMARY"
+
+      # 原始日志留档：摘要页只放结论，真要复核分布/看某一轮为什么超时，得看原文。
+      # 路径和 build job 的 release/*.zip 完全无关，不影响用户下载安装包。
+      - name: Upload raw measurement logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: latency-logs-windows
+          path: |
+            latency-conpty.log
+            latency-full.log
+          if-no-files-found: warn
 
   # ────────────────────────────────────────────────────────────────
   # verify：把一部分手工 Windows 验证自动化。
