@@ -5,7 +5,7 @@ import tseslint from 'typescript-eslint'
 // parser 配置让规则真正跑起来，其余规则块保持 brief 原文不变。见 task-5-report.md。
 export default [
   {
-    files: ['src/**/*.ts'],
+    files: ['src/**/*.ts', 'e2e/**/*.ts'],
     languageOptions: {
       parser: tseslint.parser,
     },

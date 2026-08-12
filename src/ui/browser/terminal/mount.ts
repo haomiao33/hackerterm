@@ -15,6 +15,28 @@ export interface TerminalHandle {
   dispose(): void
 }
 
+/**
+ * 端到端冒烟测试（e2e/smoke.e2e.ts）唯一的抓手。
+ *
+ * 「键盘 → PTY → 屏幕」这条链路上连续出过四个真故障，共同点是**不抛异常、
+ * 不报错**，只表现为屏幕上什么都没有；要自动化验证它，测试必须能读到 xterm
+ * 真实的屏幕缓冲区（`term.buffer.active` 逐行 `translateToString()`），而
+ * `TerminalHandle` 只暴露 write/dispose，拿不到 Terminal 实例本身。
+ *
+ * 所以这里把实例挂到 window 上。刻意用 `__htDiagnostics` 这个带双下划线、
+ * 带 Diagnostics 字样的名字，就是为了让任何人一眼看出**它不是产品 API**：
+ * 除测试外不得有任何生产代码读它，删掉它也不该影响任何功能。挂载本身是纯
+ * 赋值，不改变终端行为、不引入新的事件监听。
+ */
+declare global {
+  interface Window {
+    __htDiagnostics?: {
+      /** 已挂载的 xterm 实例，供端到端测试读屏幕缓冲区与挂时延埋点。 */
+      term: Terminal
+    }
+  }
+}
+
 export interface MountOptions {
   onInput(bytes: Uint8Array): void
   onResize(cols: number, rows: number): void
@@ -89,6 +111,10 @@ export function mountTerminal(el: HTMLElement, opts: MountOptions): TerminalHand
   const fit = new FitAddon()
   term.loadAddon(fit)
   term.open(el)
+
+  // 诊断专用（见上面 __htDiagnostics 的注释）：端到端测试靠它读屏幕缓冲区。
+  // 放在 term.open() 之后、返回之前，保证测试看到它时终端已经挂进 DOM 了。
+  window.__htDiagnostics = { term }
 
   let webgl: WebglAddon | undefined
   // 连续丢失次数：每次 attachWebgl() 成功重建就清零，所以量的是"连续"而不是

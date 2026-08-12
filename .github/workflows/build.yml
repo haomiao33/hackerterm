@@ -88,6 +88,92 @@ jobs:
           if-no-files-found: error
 
   # ────────────────────────────────────────────────────────────────
+  # smoke：「键盘 → PTY → 屏幕」最短链路的 headless 端到端冒烟。
+  #
+  # 为什么单开一个 job，而不是塞进下面的 verify：
+  # verify 在设计上就是"预期会红"的探针（见它自己的注释：`yes` 命令在
+  # Windows 上不存在，红色是有价值的信息而不是故障信号），全部步骤挂了
+  # continue-on-error，没人会因为它红去拦一次合并。把冒烟测试放进去，等于
+  # 把一个**必须当红绿灯用**的门禁塞进一个大家已经约定好忽略红色的 job，
+  # 信号会被淹掉——而这条链路正是连着两天没跑通 demo 的那条，它红了必须有人
+  # 立刻知道。所以单开 job，不加 continue-on-error：红就是真的坏了。
+  #
+  # 不设 needs: build，和 build 并行：build 是用户下载安装包的唯一来源，
+  # 冒烟红不该拦住出包（产物路径 release/*.zip 一个字都没动）。
+  #
+  # 为什么跑在 Linux 上：
+  # 1. 历史上那四个真故障里有三个（xterm.css 没引入、数据面 MessagePort
+  #    transfer 静默丢消息、亮色主题光标不可见）是渲染层/IPC 层的问题，
+  #    与操作系统无关，Linux 上一样能抓——已经用"把那行 postMessage 退回
+  #    有 bug 的写法"实测验证过测试会变红。
+  # 2. Linux runner 比 Windows runner 快且便宜，冒烟测试要跑得勤。
+  # 后续可以再加一个 Windows 冒烟 job（那边走 ConPTY，能额外覆盖
+  # crates/ht-core/src/session.rs 里 Windows 专有的那条路径）；目前没加，是因为
+  # 本轮没有 Windows 环境可以实测，不想往 CI 里塞一个没验证过的 job。
+  # ────────────────────────────────────────────────────────────────
+  smoke:
+    name: smoke e2e (linux, 键盘 → PTY → 屏幕)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry/target
+        uses: Swatinem/rust-cache@v2
+
+      # 同 build job：prost-build 不自带 protoc。
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Electron 在 headless Linux 上要有 X 服务器（xvfb）和一组 Chromium 运行时
+      # 共享库。GitHub 的 ubuntu 镜像大多已自带，这里显式装一遍，免得哪天换了镜像
+      # 就以"Missing X server or $DISPLAY"这种和本项目毫无关系的错误红掉。
+      - name: Install Electron runtime deps (xvfb + Chromium shared libs)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb libgbm1 libnss3 libatk1.0-0 libatk-bridge2.0-0 \
+            libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
+            libxfixes3 libxrandr2 libpango-1.0-0 libcairo2 libasound2t64
+
+      - name: Install dependencies (pnpm install, retry x3)
+        run: |
+          for i in 1 2 3; do
+            pnpm install --frozen-lockfile && exit 0
+            echo "pnpm install failed (attempt $i/3), retrying in 5s..."
+            sleep 5
+          done
+          echo "pnpm install failed after 3 attempts"
+          exit 1
+
+      # 端到端测试跑的是**真实构建产物**（out/ 下的主进程/utility/渲染包 + 真的
+      # .node 原生模块），所以这两步必须在测试之前跑完，缺一不可。
+      - name: Build native module (napi-rs)
+        run: pnpm build:native
+
+      - name: Build Electron app
+        run: pnpm build
+
+      # xvfb-run -a：自动挑一个没被占用的 display 号。
+      - name: E2E smoke (Playwright + real Electron + real PTY)
+        run: xvfb-run -a pnpm test:e2e
+
+  # ────────────────────────────────────────────────────────────────
   # verify：把一部分手工 Windows 验证自动化。
   #
   # 重要：这个 job 大概率会红，这是预期的、也是有价值的——

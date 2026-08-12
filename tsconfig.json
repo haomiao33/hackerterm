@@ -11,5 +11,7 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true
   },
-  "include": ["src"]
+  // e2e 一并纳入类型检查：端到端测试是回归门禁，它自己先得编得过——被
+  // "用了没声明的依赖 / 类型对不上，运行时才炸" 坑过一次就够了。
+  "include": ["src", "e2e"]
 }
