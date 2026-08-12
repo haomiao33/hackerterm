@@ -17,7 +17,7 @@
     "package:linux": "electron-builder --linux --x64",
     "bench:arrow": "tsx bench/arrow.ts",
     "test": "vitest run src",
-    "test:e2e": "vitest run --config e2e/vitest.config.ts",
+    "test:e2e": "node scripts/run-e2e.mjs",
     "measure:latency": "tsx e2e/latency.ts"
   },
   "dependencies": {

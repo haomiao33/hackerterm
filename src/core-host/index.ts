@@ -18,11 +18,22 @@ let controlPort: Electron.MessagePortMain | null = null
 const dataBuffer = new SessionDataBuffer()
 
 /**
- * ht-node 是 napi 原生模块，真机上"控制端口 97 秒才就绪"的头号怀疑对象
- * 就是它的加载耗时——原生插件要经过动态链接/初始化，冷启动可能比纯 JS
- * 模块慢一到两个数量级。这里特意改成动态 import 而不是文件顶部的静态
- * import：静态 import 会被提升到本模块最前面执行，没法在它前后插时间戳；
- * 动态 import 是一条普通语句，能老老实实地在 await 前后各打一个点。
+ * ht-node 的加载耗时曾被当作"控制端口 97 秒才就绪"的头号怀疑对象——理由是
+ * napi 原生模块要经过动态链接/初始化，冷启动可能比纯 JS 慢一到两个数量级。
+ * **这个怀疑已被实测推翻：真机上 ht_node 导入只用 11–18ms**（五次冷启动
+ * 数据见 docs/superpowers/verification/startup-latency-investigation.md）。
+ *
+ * 当初为什么会猜错：那份日志里 `core-host:ht_node_import_end` 出现在
+ * +81294ms，看上去像是"加载完它就花了 81 秒"；实际上那是**整个 utility
+ * 进程从 fork 到真正跑起来**用了 81 秒（`main:fork_call → main:core_spawn`
+ * 恒定 80.5–81.1s），进程一起来，模块加载本身十几毫秒就结束了。教训是：
+ * 绝对时间戳只能说明"这一刻发生了什么"，不能拿来当某一段的耗时——两个
+ * 相邻埋点之间的差值才是。想往这个方向再查的人可以就此打住，瓶颈在进程
+ * 创建那一段，不在这里。
+ *
+ * 动态 import 保留：埋点本身仍然有价值（现在它的作用反过来了，是持续证明
+ * 这一段不是瓶颈）。静态 import 会被提升到本模块最前面执行，没法在它前后
+ * 插时间戳；动态 import 是一条普通语句，能老老实实地在 await 前后各打一个点。
  */
 async function bootCoreHost(): Promise<void> {
   const importStart = Date.now()
@@ -61,7 +72,14 @@ async function bootCoreHost(): Promise<void> {
     const [port] = e.ports
     if (e.data?.kind === 'control') {
       controlPort = port
-      port.on('message', (m) => send(Buffer.from(m.data as Uint8Array)))
+      port.on('message', (m) => {
+        // 显式声明而不是 `m.data as Uint8Array`：electron.d.ts 把
+        // MessageEvent.data 声明成 any，**在 any 上做 as 断言纯属装饰、永远
+        // 不会被检查**，写错也没人拦（下面数据面同一处踩过这个坑）。声明式
+        // 写法则会让类型错误在 Buffer.from 这个用法上暴露出来。
+        const bytes: Uint8Array = m.data
+        send(Buffer.from(bytes))
+      })
       port.start()
     } else if (e.data?.kind === 'data') {
       const { sessionId } = e.data
@@ -88,6 +106,25 @@ async function bootCoreHost(): Promise<void> {
     }
   })
 }
+
+/**
+ * core-host 是 utility 进程：没有窗口、没有 DevTools，打包后 stdout/stderr
+ * 也没人看。这里出了未捕获异常，唯一的外部表现就是"控制/数据端口从此不再
+ * 有任何回音"——纯哑火，而且会把排障方向带偏到 IPC 链路上去。所以经
+ * parentPort 把现场报回主进程，主进程再转进页面日志区（见
+ * src/main/diagnostics.ts 的 watchCore）。
+ *
+ * 注册在最外层、`bootCoreHost()` 之前：ht-node 加载失败、协议回调里抛异常
+ * 这类故障恰恰发生在启动最早期，晚一步注册就白装了。`bootCoreHost()` 是个
+ * 没人 catch 的 async 调用，它内部任何一处 reject 也都由这里的
+ * unhandledRejection 兜住。
+ */
+function reportFailure(kind: string, err: unknown): void {
+  const detail = err instanceof Error ? err.stack ?? `${err.name}: ${err.message}` : String(err)
+  process.parentPort.postMessage({ kind: 'error', detail: `${kind}: ${detail}` })
+}
+process.on('uncaughtException', (err) => reportFailure('uncaughtException', err))
+process.on('unhandledRejection', (reason) => reportFailure('unhandledRejection', reason))
 
 // process.parentPort 的 'message' 监听器虽然要等 ht-node 加载完才注册，但
 // Electron 文档明确保证：注册前收到的消息会排队，不会丢（"Messages

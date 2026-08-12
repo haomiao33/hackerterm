@@ -5,14 +5,18 @@ import {
 } from '../common/protocol/hackerterm'
 import { mountTerminal } from './terminal/mount'
 import { log } from './diagnostics/log'
+import { installErrorHandlers } from './diagnostics/errors'
 import { createIncomingDataLogger } from './diagnostics/byte-throttle'
 import { logStartupTiming } from './diagnostics/startup-timing'
 
-// preload 通过 contextBridge 暴露的唯一入口：请求给某个会话开一条数据通道。
+// preload 通过 contextBridge 暴露的两个入口：要控制通道、要某个会话的数据
+// 通道。两者都是"渲染进程主动请求、主进程应答"的同一个模式（官方
+// docs/tutorial/message-ports.md 的 request-worker-channel）。
 // 这是类型声明，不是 import 'electron'——ui/browser 仍然不依赖 Electron。
 declare global {
   interface Window {
     ht: {
+      requestControlPort(): void
       openDataPort(sessionId: string): void
     }
   }
@@ -29,15 +33,39 @@ const INITIAL_ROWS = 24
 /** 诊断日志里 sessionId 只截前几位，够辨认又不占屏幕（日志区高度有限）。 */
 const SESSION_ID_LOG_PREFIX_LENGTH = 8
 
+// 页面自己的兜底错误捕获要最先装：下面任何一处抛异常，都得在日志区留下痕迹，
+// 而不是让页面停在半截却什么都不说。
+installErrorHandlers()
+
+/**
+ * 只认本页面 preload 转进来的消息。
+ *
+ * `window` 上的 message 事件是公共的：iframe、任何拿到本窗口引用的代码都能
+ * 往这儿发，只判 `e.data.kind` 等于让谁都能伪造一条"控制端口就绪"。官方
+ * docs/tutorial/message-ports.md 的示例正是用 `event.source === window` 做
+ * 校验——preload 是在同一个 window 上 postMessage 的（只是在隔离世界里），
+ * 所以 source 就是本 window 自己。
+ */
+function fromPreload(e: MessageEvent): boolean {
+  return e.source === window
+}
+
 // 主进程 + core-host 的启动时间线埋点，随时可能到达（早于或晚于控制端口），
 // 独立监听、不影响下面握手主流程。
 window.addEventListener('message', (e) => {
-  if (e.data?.kind !== 'startup-timing') return
+  if (!fromPreload(e) || e.data?.kind !== 'startup-timing') return
   logStartupTiming(e.data.timings)
 })
 
+// 主进程 / core-host 的故障上报（见 src/main/diagnostics.ts）。三个进程的
+// 错误最终都汇到这块日志区，因为真机上用户只能截这一块图。
 window.addEventListener('message', (e) => {
-  if (e.data?.kind !== 'port:control') return
+  if (!fromPreload(e) || e.data?.kind !== 'diagnostic') return
+  log(e.data.line)
+})
+
+window.addEventListener('message', (e) => {
+  if (!fromPreload(e) || e.data?.kind !== 'port:control') return
   log('control port ready')
   const port = e.ports[0]
   const client = new ProtocolClient({ send: (b) => port.postMessage(b) })
@@ -74,6 +102,12 @@ window.addEventListener('message', (e) => {
     .catch((err) => log(`handshake failed: ${err?.key ?? err}`))
 })
 
+// 监听器全挂好之后再去要控制端口——请求-应答模式下端口只可能在这一行之后
+// 到达，所以"端口来了却没人接"这个窗口从根上不存在（也正因如此，preload 那
+// 边不需要官方示例里的 `await windowLoaded`，理由见 src/preload/index.ts）。
+log('requesting control port')
+window.ht.requestControlPort()
+
 /** 握手成功后开一个会话，拿到 sessionId 就去要数据端口。 */
 function openSession(client: ProtocolClient): Promise<void> {
   const payload = SessionOpenRequest.encode({
@@ -100,14 +134,18 @@ function openSession(client: ProtocolClient): Promise<void> {
  */
 function waitForDataPort(sessionId: string, client: ProtocolClient): void {
   const onPort = (e: MessageEvent): void => {
-    if (e.data?.kind !== 'port:data' || e.data.sessionId !== sessionId) return
+    if (!fromPreload(e) || e.data?.kind !== 'port:data' || e.data.sessionId !== sessionId) return
     // 这条时间戳和上面 session.open 返回的时间戳的差值，直接暴露数据面
     // 启动的竞态窗口——两者本应背靠背，间隔越大越可疑。
     log('data port ready')
     window.removeEventListener('message', onPort)
 
+    // 这里**不能**调 dataPort.start()：下面赋值 onmessage 本身就会隐式 start，
+    // 提前 start 只会打开一个"已经开始派发、但还没有 onmessage"的窗口，落进
+    // 这个窗口的消息会被直接丢掉。现在 start 与 onmessage 之间是同步代码，
+    // 看起来没事；可只要将来谁在中间插一个 await（比如异步初始化终端），会话
+    // 最早那批输出就会静默消失——正是本项目反复踩的那类哑火。
     const dataPort = e.ports[0]
-    dataPort.start()
 
     const el = document.getElementById('terminal')!
     const logIncoming = createIncomingDataLogger()
