@@ -113,8 +113,17 @@ function waitForDataPort(sessionId: string, client: ProtocolClient): void {
     const logIncoming = createIncomingDataLogger()
     const term = mountTerminal(el, {
       onInput(bytes) {
-        // 直接 transfer 底层 ArrayBuffer：数据面不许转字符串、不许 JSON 序列化。
-        dataPort.postMessage(bytes.buffer, [bytes.buffer])
+        // 千万别为了"零拷贝"改成 postMessage(bytes.buffer, [bytes.buffer])：
+        // 对端是 utility 进程的 MessagePortMain，而 Electron 在这个方向上只把
+        // MessagePortMain 当合法 transferable——transfer 列表里一旦出现
+        // ArrayBuffer，整条消息（连同数据本身）会被整体丢弃，不报错也不抛异常
+        // （electron#34905，至今 open，Electron 43 仍复现）。真机症状就是出向
+        // onData 日志 200+ 条条条都在、PTY 一个字节都收不到，纯哑火最难查。
+        // 反方向（core-host → 渲染）已经踩过同一个坑，见 commit bb36cc6，这次
+        // 是它的镜像；控制面 port.postMessage(b) 和数据面入向也都是这么发的。
+        // 老老实实走一次 structured clone 拷贝，量级 10GB/s，键盘输入这点量
+        // 根本不是瓶颈。数据面依旧只传字节，不转字符串、不做 JSON 序列化。
+        dataPort.postMessage(bytes)
       },
       onResize(cols, rows) {
         const req = SessionResizeRequest.encode({ sessionId, cols, rows }).finish()

@@ -74,7 +74,16 @@ async function bootCoreHost(): Promise<void> {
       // 关闭是这条数据通道本身能感知到的、不需要额外状态的信号，用它来触发
       // detach 不需要引入新的跨模块依赖。
       port.on('close', () => dataBuffer.detach(sessionId))
-      port.on('message', (m) => sendData(sessionId, Buffer.from(m.data as ArrayBuffer)))
+      port.on('message', (m) => {
+        // 渲染侧发的是 Uint8Array 且不带 transfer（见 boot.ts 里那段注释），
+        // 经 structured clone 到这边原样还是 Uint8Array——原来写 `as ArrayBuffer`
+        // 是错的，而 Electron 把 MessageEvent.data 声明成 any，强断言根本没被
+        // 类型检查过，错了也没人拦（bb36cc6 那句 `as unknown as
+        // MessagePortMain[]` 是同一种坑）。这里改成显式声明而不是断言：类型写
+        // 错时 tsc 会在下游用法上报出来，不再被 as 压掉。
+        const bytes: Uint8Array = m.data
+        sendData(sessionId, Buffer.from(bytes))
+      })
       port.start()
     }
   })
