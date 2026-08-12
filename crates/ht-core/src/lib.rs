@@ -40,8 +40,12 @@ impl Core {
         self.sessions.write(session_id, bytes);
     }
 
-    /// 当前存活的 PTY 读线程数量。转发 `SessionManager::live_read_threads`，
-    /// 用于诊断与测试，确认会话关闭后线程确实退出。
+    /// 当前存活的 PTY 读线程数量。转发 `SessionManager::live_read_threads`。
+    ///
+    /// 这个数字此前只有测试在用，真机上"读线程到底死没死"完全看不见——而读线程
+    /// 静默退出（panic 会直接跳过 `on_read_stopped` 的上报路径）恰恰是"数据永远
+    /// 不再来"这个症状最可能的解释。现在它经控制面的 `core.stats` 方法暴露给
+    /// 渲染层（见 `router.rs`），能落进页面日志、也能在 DevTools 里随时查。
     pub fn live_read_threads(&self) -> usize {
         self.sessions.live_read_threads()
     }

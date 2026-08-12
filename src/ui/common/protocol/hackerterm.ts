@@ -127,6 +127,41 @@ export interface SessionExitEvent {
   exitCode: number;
 }
 
+/**
+ * 流控停摆自愈事件（topic: session.flow_stalled）。
+ *
+ * 读线程因高水位暂停后，整整一个看门狗周期内未确认字节数一个字节都没降，判定
+ * ack 通路已断，于是强制清零未确认窗口继续读（VS Code 的
+ * TerminalProcess.clearUnacknowledgedChars() 等价物）。清零等于放弃背压，是
+ * 降级不是修复，所以必须报出来——静默自愈会让真实的 ack 链路故障永远查不出来。
+ *
+ * 为什么不复用 SessionStateEvent：那个消息的语义是"会话状态机变到了哪一档"
+ * （Connected/Closed/Failed），而这里会话既没关也没失败，只是流控记账被放弃了；
+ * 塞进 Failed 会让渲染层以为会话已经死了。
+ */
+export interface SessionFlowStalledEvent {
+  sessionId: string;
+  /** 被强制丢弃的未确认字节数 */
+  unacknowledgedBytes: number;
+  /** 判定停摆用的等待时长 */
+  stalledMs: number;
+}
+
+/**
+ * core.stats：进程级诊断快照。
+ *
+ * 存在的理由是"读线程死没死"在真机上完全不可见。读线程停止的正常路径已经会经
+ * session.state 报出来，但**panic 会直接跳过那条上报**，而"数据永远不再来"正是
+ * 本项目反复出现的症状。所以需要一个不依赖任何事件、随时可查的计数——事件只能
+ * 证明发生过什么，证明不了此刻还剩几个线程活着。
+ */
+export interface CoreStatsRequest {
+}
+
+export interface CoreStatsResponse {
+  liveReadThreads: number;
+}
+
 function createBaseEnvelope(): Envelope {
   return { request: undefined, response: undefined, event: undefined };
 }
@@ -985,6 +1020,128 @@ export const SessionExitEvent: MessageFns<SessionExitEvent> = {
           }
 
           message.exitCode = reader.int32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+};
+
+function createBaseSessionFlowStalledEvent(): SessionFlowStalledEvent {
+  return { sessionId: "", unacknowledgedBytes: 0, stalledMs: 0 };
+}
+
+export const SessionFlowStalledEvent: MessageFns<SessionFlowStalledEvent> = {
+  encode(message: SessionFlowStalledEvent, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sessionId !== "") {
+      writer.uint32(10).string(message.sessionId);
+    }
+    if (message.unacknowledgedBytes !== 0) {
+      writer.uint32(16).uint64(message.unacknowledgedBytes);
+    }
+    if (message.stalledMs !== 0) {
+      writer.uint32(24).uint64(message.stalledMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SessionFlowStalledEvent {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSessionFlowStalledEvent();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.sessionId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.unacknowledgedBytes = longToNumber(reader.uint64());
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.stalledMs = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+};
+
+function createBaseCoreStatsRequest(): CoreStatsRequest {
+  return {};
+}
+
+export const CoreStatsRequest: MessageFns<CoreStatsRequest> = {
+  encode(_: CoreStatsRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CoreStatsRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCoreStatsRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+};
+
+function createBaseCoreStatsResponse(): CoreStatsResponse {
+  return { liveReadThreads: 0 };
+}
+
+export const CoreStatsResponse: MessageFns<CoreStatsResponse> = {
+  encode(message: CoreStatsResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.liveReadThreads !== 0) {
+      writer.uint32(8).uint32(message.liveReadThreads);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CoreStatsResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCoreStatsResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.liveReadThreads = reader.uint32();
           continue;
         }
       }

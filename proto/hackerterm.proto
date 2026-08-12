@@ -87,3 +87,30 @@ enum SessionState {
 }
 message SessionStateEvent { string session_id = 1; SessionState state = 2; Error error = 3; }
 message SessionExitEvent  { string session_id = 1; int32 exit_code = 2; }
+
+// 流控停摆自愈事件（topic: session.flow_stalled）。
+//
+// 读线程因高水位暂停后，整整一个看门狗周期内未确认字节数一个字节都没降，判定
+// ack 通路已断，于是强制清零未确认窗口继续读（VS Code 的
+// TerminalProcess.clearUnacknowledgedChars() 等价物）。清零等于放弃背压，是
+// 降级不是修复，所以必须报出来——静默自愈会让真实的 ack 链路故障永远查不出来。
+//
+// 为什么不复用 SessionStateEvent：那个消息的语义是"会话状态机变到了哪一档"
+// （Connected/Closed/Failed），而这里会话既没关也没失败，只是流控记账被放弃了；
+// 塞进 Failed 会让渲染层以为会话已经死了。
+message SessionFlowStalledEvent {
+  string session_id           = 1;
+  uint64 unacknowledged_bytes = 2;  // 被强制丢弃的未确认字节数
+  uint64 stalled_ms           = 3;  // 判定停摆用的等待时长
+}
+
+// ---- 诊断 ----
+
+// core.stats：进程级诊断快照。
+//
+// 存在的理由是"读线程死没死"在真机上完全不可见。读线程停止的正常路径已经会经
+// session.state 报出来，但**panic 会直接跳过那条上报**，而"数据永远不再来"正是
+// 本项目反复出现的症状。所以需要一个不依赖任何事件、随时可查的计数——事件只能
+// 证明发生过什么，证明不了此刻还剩几个线程活着。
+message CoreStatsRequest  {}
+message CoreStatsResponse { uint32 live_read_threads = 1; }

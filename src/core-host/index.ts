@@ -1,3 +1,4 @@
+import { DataBatcher } from '../ui/common/data-batcher'
 import { SessionDataBuffer } from '../ui/common/session-data-buffer'
 
 // 本文件（core-host 入口模块）开始执行的时刻：全链路时间线里 core-host
@@ -16,6 +17,32 @@ let controlPort: Electron.MessagePortMain | null = null
 // 消失。这里改用 SessionDataBuffer 顶住这个窗口：端口就绪前先攒着，
 // `attach` 时按到达顺序一次性冲刷。
 const dataBuffer = new SessionDataBuffer()
+
+/**
+ * PTY 出向数据的合批器，每会话一个。
+ *
+ * 为什么放在这里，而不是 Rust 读线程或渲染侧：真机日志里一条 `ls` 的输出在 54ms
+ * 内产生了 11 条 IPC 消息，其中一条只有 1 个字节。这些消息的真正代价发生在
+ * **core-host → 渲染进程**这一跳（跨进程 structured clone + 两侧事件循环各调度
+ * 一次 + 渲染侧一次 xterm.write），而 core-host 正是这一跳之前最后一个能拦住它们
+ * 的地方。
+ * - 放 Rust 读线程：那里阻塞在 `reader.read()` 上，要做定时窗口就得再引入一个
+ *   计时线程或换非阻塞读，为了省 napi 那一小段开销付出的复杂度不划算；
+ * - 放渲染侧：IPC 消息已经发生了，省不掉任何东西。
+ *
+ * 合批**在** `dataBuffer` **之前**：合批器只管"少发几条消息"，端口就绪前的缓冲
+ * 是另一件事（别把最早那批输出丢了），两者职责不重叠，串起来即可。
+ */
+const dataBatchers = new Map<string, DataBatcher>()
+
+function batcherFor(sessionId: string): DataBatcher {
+  let batcher = dataBatchers.get(sessionId)
+  if (!batcher) {
+    batcher = new DataBatcher((data) => dataBuffer.push(sessionId, data))
+    dataBatchers.set(sessionId, batcher)
+  }
+  return batcher
+}
 
 /**
  * ht-node 的加载耗时曾被当作"控制端口 97 秒才就绪"的头号怀疑对象——理由是
@@ -41,7 +68,7 @@ async function bootCoreHost(): Promise<void> {
   const importEnd = Date.now()
 
   // 把 core-host 这几个时间点回报给主进程，main/startup-timing.ts 会接进
-  // 统一时间线再转发给渲染进程日志区。走的是 utility process 内置的
+  // 统一时间线再转发给渲染进程的诊断日志。走的是 utility process 内置的
   // parentPort <-> UtilityProcess 消息通道，跟下面 control/data 两个
   // MessageChannelMain 端口完全独立，不会互相干扰。
   process.parentPort.postMessage({
@@ -61,7 +88,7 @@ async function bootCoreHost(): Promise<void> {
     // 这条限制只存在于 MessagePortMain 这一侧；渲染进程用的标准 DOM MessagePort
     // 支持 ArrayBuffer transfer，方向相反时可以用。这里老老实实走一次
     // structured clone 的内存拷贝，量级在 10GB/s，不是瓶颈。
-    dataBuffer.push(sessionId, new Uint8Array(buf))
+    batcherFor(sessionId).push(new Uint8Array(buf))
   })
 
   start((buf: Buffer) => {
@@ -91,7 +118,14 @@ async function bootCoreHost(): Promise<void> {
       // （没有会话状态机、也不订阅 session.close 一类的控制面事件），而端口
       // 关闭是这条数据通道本身能感知到的、不需要额外状态的信号，用它来触发
       // detach 不需要引入新的跨模块依赖。
-      port.on('close', () => dataBuffer.detach(sessionId))
+      port.on('close', () => {
+        dataBuffer.detach(sessionId)
+        // 合批器跟 dataBuffer 同生共死：它内部挂着一个 setTimeout，只 detach
+        // 缓冲区而留着合批器，就会留下一个永远指向已关闭端口的定时器 + 一条
+        // 随会话数无限增长的 Map 记录（泄漏）。
+        dataBatchers.get(sessionId)?.dispose()
+        dataBatchers.delete(sessionId)
+      })
       port.on('message', (m) => {
         // 渲染侧发的是 Uint8Array 且不带 transfer（见 boot.ts 里那段注释），
         // 经 structured clone 到这边原样还是 Uint8Array——原来写 `as ArrayBuffer`
@@ -111,7 +145,7 @@ async function bootCoreHost(): Promise<void> {
  * core-host 是 utility 进程：没有窗口、没有 DevTools，打包后 stdout/stderr
  * 也没人看。这里出了未捕获异常，唯一的外部表现就是"控制/数据端口从此不再
  * 有任何回音"——纯哑火，而且会把排障方向带偏到 IPC 链路上去。所以经
- * parentPort 把现场报回主进程，主进程再转进页面日志区（见
+ * parentPort 把现场报回主进程，主进程再转进页面诊断日志（见
  * src/main/diagnostics.ts 的 watchCore）。
  *
  * 注册在最外层、`bootCoreHost()` 之前：ht-node 加载失败、协议回调里抛异常

@@ -21,12 +21,12 @@ ipcRenderer.on('port:data', (e, payload) => {
   window.postMessage({ kind: 'port:data', sessionId: payload.sessionId }, '*', e.ports)
 })
 // 主进程 + core-host 的启动时间线埋点：诊断信息，走普通 IPC 转发到页面的
-// 日志区，跟上面两条端口转发（数据面）是两回事。
+// 诊断日志，跟上面两条端口转发（数据面）是两回事。
 ipcRenderer.on('startup-timing', (e, timings) => {
   window.postMessage({ kind: 'startup-timing', timings }, '*')
 })
 // 主进程 + core-host 的故障上报（未捕获异常、GPU/渲染进程崩溃、core 退出
-// 等），同样只是转发到页面日志区——真机上那块文字是唯一能带回来的证据。
+// 等），同样只是转发到页面的诊断日志——三个进程的故障汇到同一处才看得清。
 ipcRenderer.on('diagnostic', (e, line: string) => {
   window.postMessage({ kind: 'diagnostic', line }, '*')
 })

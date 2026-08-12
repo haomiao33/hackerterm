@@ -1,7 +1,9 @@
+import { AckBatcher } from '../common/ack-batcher'
 import { ProtocolClient } from '../common/protocol/client'
 import {
-  Hello, SessionAckRequest, SessionExitEvent, SessionOpenRequest, SessionOpenResponse,
-  SessionResizeRequest, SessionState, SessionStateEvent,
+  CoreStatsRequest, CoreStatsResponse, Hello, SessionAckRequest, SessionExitEvent,
+  SessionFlowStalledEvent, SessionOpenRequest, SessionOpenResponse, SessionResizeRequest,
+  SessionState, SessionStateEvent,
 } from '../common/protocol/hackerterm'
 import { mountTerminal } from './terminal/mount'
 import { log } from './diagnostics/log'
@@ -30,11 +32,11 @@ declare global {
 const INITIAL_COLS = 80
 const INITIAL_ROWS = 24
 
-/** 诊断日志里 sessionId 只截前几位，够辨认又不占屏幕（日志区高度有限）。 */
+/** 诊断日志里 sessionId 只截前几位，够辨认又不至于让每行都被一串 uuid 撑长。 */
 const SESSION_ID_LOG_PREFIX_LENGTH = 8
 
-// 页面自己的兜底错误捕获要最先装：下面任何一处抛异常，都得在日志区留下痕迹，
-// 而不是让页面停在半截却什么都不说。
+// 页面自己的兜底错误捕获要最先装：下面任何一处抛异常，都得在诊断日志里留下
+// 痕迹，而不是让页面停在半截却什么都不说。
 installErrorHandlers()
 
 /**
@@ -57,8 +59,9 @@ window.addEventListener('message', (e) => {
   logStartupTiming(e.data.timings)
 })
 
-// 主进程 / core-host 的故障上报（见 src/main/diagnostics.ts）。三个进程的
-// 错误最终都汇到这块日志区，因为真机上用户只能截这一块图。
+// 主进程 / core-host 的故障上报（见 src/main/diagnostics.ts）。三个进程的错误
+// 最终都汇到渲染进程的 console，用户开 DevTools（或主进程带 --enable-logging
+// 时看 stdout）就能一次看全，不必分别去翻三个进程。
 window.addEventListener('message', (e) => {
   if (!fromPreload(e) || e.data?.kind !== 'diagnostic') return
   log(e.data.line)
@@ -87,6 +90,21 @@ window.addEventListener('message', (e) => {
     const stateName = SessionState[ev.state] ?? `unknown(${ev.state})`
     const errorSuffix = ev.error ? ` error=${ev.error.key}: ${ev.error.detail}` : ''
     log(`session.state ← ${ev.sessionId.slice(0, SESSION_ID_LOG_PREFIX_LENGTH)}… state=${stateName}${errorSuffix}`)
+    // 状态一变就顺手把读线程存活数打一份：它跟"数据还会不会来"直接相关，
+    // 而这正是状态变化时最想知道的那个数。
+    logCoreStats(client)
+  })
+  // 流控停摆自愈：核心等了整整一个看门狗周期都等不到 ack，强制清零了未确认
+  // 窗口才没让终端永久冻结。这不是好消息，是"我们刚刚放弃了一次背压"——
+  // ack 链路上有真实故障，必须让它在日志里显眼，绝不能静默过去。
+  client.on('session.flow_stalled', (payload) => {
+    const ev = SessionFlowStalledEvent.decode(payload)
+    const line =
+      `session.flow_stalled ← ${ev.sessionId.slice(0, SESSION_ID_LOG_PREFIX_LENGTH)}… ` +
+      `核心等了 ${ev.stalledMs}ms 没等到任何 ack，强制丢弃 ${ev.unacknowledgedBytes}B 未确认记账以避免永久冻结` +
+      '（ack 链路有故障，不是正常现象）'
+    log(line)
+    console.warn(line)
   })
 
   const payload = Hello.encode({
@@ -108,6 +126,30 @@ window.addEventListener('message', (e) => {
 log('requesting control port')
 window.ht.requestControlPort()
 
+/**
+ * 查一次核心的存活读线程数并写进日志。
+ *
+ * 为什么值得单独有这么一条：读线程一死，这个会话往后就再也不会有数据回来，
+ * 而症状只有"屏幕不动了"。正常停止路径已经会经 `session.state` 报出来，
+ * 但**读线程 panic 会直接跳过那条上报**——事件能证明发生过什么，证明不了
+ * 此刻还剩几个线程活着。所以这里用请求-应答主动查，而不是等事件。
+ *
+ * 调用时机刻意选得很稀（会话建立时、状态变化时，外加 DevTools 里手动查），
+ * 不做周期轮询：那等于把这一轮刚从控制面省下来的往返又加回去。
+ */
+function logCoreStats(client: ProtocolClient): Promise<number> {
+  return client.request('core.stats', CoreStatsRequest.encode({}).finish())
+    .then((p) => {
+      const { liveReadThreads } = CoreStatsResponse.decode(p)
+      log(`core.stats → live read threads = ${liveReadThreads}`)
+      return liveReadThreads
+    })
+    .catch((err) => {
+      log(`core.stats failed: ${err?.key ?? err}`)
+      return -1
+    })
+}
+
 /** 握手成功后开一个会话，拿到 sessionId 就去要数据端口。 */
 function openSession(client: ProtocolClient): Promise<void> {
   const payload = SessionOpenRequest.encode({
@@ -117,6 +159,8 @@ function openSession(client: ProtocolClient): Promise<void> {
     .then((p) => {
       const { sessionId } = SessionOpenResponse.decode(p)
       log(`session.open → ${sessionId.slice(0, SESSION_ID_LOG_PREFIX_LENGTH)}…`)
+      // 会话刚建立时的基线读数：后面任何一次复查都要跟它比才有意义。
+      logCoreStats(client)
       waitForDataPort(sessionId, client)
       window.ht.openDataPort(sessionId)
     })
@@ -149,6 +193,25 @@ function waitForDataPort(sessionId: string, client: ProtocolClient): void {
 
     const el = document.getElementById('terminal')!
     const logIncoming = createIncomingDataLogger()
+
+    // ack 批处理。原先每次 xterm write 回调都发一次 `session.ack`，走控制面、
+    // 编 protobuf、建 pending promise、等应答；一个按键的回显（PowerShell 实测
+    // 分两批数据回来）就要付两趟完整往返，而它确认的字节数往往只有个位数。
+    // 攒够 FLOW_ACK_BATCH_BYTES 再发一次，这是纯赚——ack 是反向的流控信号，
+    // 晚发一点只影响核心对未确认字节数的估计精度，完全不在"按键 → 屏幕"这条
+    // 链路上。阈值必须 <= 低水位，理由见 ack-batcher.ts / limits.rs。
+    const ackBatcher = new AckBatcher((bytesConsumed) => {
+      const req = SessionAckRequest.encode({ sessionId, bytesConsumed }).finish()
+      client.request('session.ack', req).catch((err) => {
+        // 关键：不能只打一行日志就算完。ack 一丢，那批字节在核心侧就永远
+        // 是"未确认"，累积过高水位后读线程永久暂停、终端彻底冻住——这正是
+        // 本项目最典型的静默失效，而批处理会把单次损失从几字节放大成一整批。
+        // 退回给批处理器，下一次冲刷时连本次一起重发。
+        log(`ack failed（${bytesConsumed}B 退回重试）: ${err?.key ?? err}`)
+        ackBatcher.returnUnacknowledged(bytesConsumed)
+      })
+    })
+
     const term = mountTerminal(el, {
       onInput(bytes) {
         // 千万别为了"零拷贝"改成 postMessage(bytes.buffer, [bytes.buffer])：
@@ -168,10 +231,14 @@ function waitForDataPort(sessionId: string, client: ProtocolClient): void {
         client.request('session.resize', req).catch((err) => log(`resize failed: ${err?.key ?? err}`))
       },
       onConsumed(bytes) {
-        const req = SessionAckRequest.encode({ sessionId, bytesConsumed: bytes }).finish()
-        client.request('session.ack', req).catch((err) => log(`ack failed: ${err?.key ?? err}`))
+        ackBatcher.consumed(bytes)
       },
     })
+
+    // 诊断入口（不是产品 API，见 mount.ts 里 __htDiagnostics 的注释）：
+    // 用户能开 DevTools，"此刻还剩几个读线程活着"是排查"数据怎么不来了"时
+    // 最想随时问一遍的那个数，做成可手动调用的比只在几个时机打日志有用得多。
+    window.__htDiagnostics = { ...window.__htDiagnostics!, coreStats: () => logCoreStats(client) }
 
     dataPort.onmessage = (m) => {
       const bytes = new Uint8Array(m.data)
