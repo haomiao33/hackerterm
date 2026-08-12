@@ -1,4 +1,4 @@
-use crate::flow::FlowWindow;
+use crate::flow::{FlowWindow, ResumeOutcome};
 use portable_pty::{ChildKiller, CommandBuilder, NativePtySystem, PtyPair, PtySize, PtySystem};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -16,6 +16,19 @@ pub type DataOut = Arc<dyn Fn(String, Vec<u8>) + Send + Sync>;
 pub enum ReadStopReason {
     Eof,
     Error(String),
+}
+
+/// 流控停摆自愈的现场：读线程等了整整一个看门狗周期，未确认字节数一个字节都没降，
+/// 判定 ack 通路已断，于是强制清零未确认窗口继续读。
+///
+/// 这件事**必须**被上报（见 `SessionManager::open` 的 `on_flow_stalled`）：
+/// 清零等于放弃背压，是"两害相权取其轻"的降级，不是修复。静默自愈会让一个真实的
+/// ack 链路故障永远不被发现，只留下"偶尔内存涨得厉害"这种查无可查的症状。
+pub struct FlowStallReport {
+    /// 被强制丢弃的未确认字节数。
+    pub unacknowledged_bytes: u64,
+    /// 判定停摆用的等待时长（毫秒）。
+    pub stalled_ms: u64,
 }
 
 pub struct Session {
@@ -68,6 +81,7 @@ impl SessionManager {
         cwd: &str,
         on_exit: Arc<dyn Fn(String, i32) + Send + Sync>,
         on_read_stopped: Arc<dyn Fn(String, ReadStopReason) + Send + Sync>,
+        on_flow_stalled: Arc<dyn Fn(String, FlowStallReport) + Send + Sync>,
     ) -> std::io::Result<String> {
         let sys = NativePtySystem::default();
         let pair = sys
@@ -108,31 +122,46 @@ impl SessionManager {
         let read_id = id.clone();
         let read_flow = flow.clone();
         let read_stop_id = id.clone();
+        let flow_stall_id = id.clone();
         self.live_read_threads.fetch_add(1, Ordering::SeqCst);
         let live_read_threads = self.live_read_threads.clone();
         std::thread::spawn(move || {
             let mut buf = vec![0u8; crate::limits::READ_BUFFER_BYTES];
             loop {
-                // 未确认字节数超过高水位：进入暂停，自旋等到真正降回低水位以下
-                // （should_resume()）才退出，不能用 !should_pause() 当退出条件——
-                // 那样只要降破高水位就恢复，会在高水位附近反复抖动，架空了
-                // FlowWindow::new 里 `low < high` 迟滞设计的意义。
-                // 用轮询而不是条件变量，因为 ack 来自另一个（控制面）线程，
-                // 轮询间隔见 limits::FLOW_PAUSE_POLL_INTERVAL_MS 的注释。
+                // 未确认字节数超过高水位：进入暂停，阻塞等到真正降回低水位以下
+                // （Resumed）才继续，不能用 !should_pause() 当恢复条件——那样只要
+                // 降破高水位就恢复，会在高水位附近反复抖动，架空了 FlowWindow::new
+                // 里 `low < high` 迟滞设计的意义。
                 //
-                // 第二个退出条件 is_closed()：`SessionManager::close` remove 会话之后，
-                // `ack` 再也无法触达这个 flow（`sessions.lock().get(id)` 恒为 None），
-                // should_resume() 会永远是 false。没有 is_closed()，这个自旋在会话
-                // 关闭后就再也没有出口——`killer.kill()` 杀的是子进程，唤不醒卡在这里
-                // （根本没走到 `reader.read()`）的读线程。
+                // 等待是**条件变量阻塞**而不是自旋轮询（原先是 2ms 一轮，
+                // 每会话每秒 500 次无效唤醒，10+ 并发会话就是每秒数千次），
+                // 唤醒由 on_ack / close / clear_unacknowledged 推送，见
+                // FlowWindow::wait_for_resume。
+                //
+                // 三种结局分别对应三件不同的事，都不能少：
+                // - Closed：`SessionManager::close` remove 会话之后，`ack` 再也无法
+                //   触达这个 flow（`sessions.lock().get(id)` 恒为 None），恢复条件
+                //   会永远为假。没有这条出口，等待在会话关闭后就再也醒不来——
+                //   `killer.kill()` 杀的是子进程，唤不醒卡在这里（根本没走到
+                //   `reader.read()`）的读线程。这是修过的一个 Critical，改成条件变量
+                //   之后靠 `close()` 里的 notify_all 保住同样的语义。
+                // - Stalled：ack 通路断了。强制清零 + 上报，绝不静默（见下）。
+                // - Resumed：正常恢复，继续读。
                 if read_flow.should_pause() {
-                    while !read_flow.should_resume() && !read_flow.is_closed() {
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            crate::limits::FLOW_PAUSE_POLL_INTERVAL_MS,
-                        ));
-                    }
-                    if read_flow.is_closed() {
-                        break;
+                    match read_flow.wait_for_resume(std::time::Duration::from_millis(
+                        crate::limits::FLOW_PAUSE_STALL_TIMEOUT_MS,
+                    )) {
+                        ResumeOutcome::Closed => break,
+                        ResumeOutcome::Resumed => {}
+                        ResumeOutcome::Stalled { stalled_ms, .. } => {
+                            // 放弃背压换取"不永久冻结"。清零之前先把现场读出来，
+                            // 上报的是真正被丢掉的那个数字。
+                            let unacknowledged_bytes = read_flow.clear_unacknowledged();
+                            on_flow_stalled(
+                                flow_stall_id.clone(),
+                                FlowStallReport { unacknowledged_bytes, stalled_ms },
+                            );
+                        }
                     }
                 }
                 match reader.read(&mut buf) {
@@ -218,9 +247,11 @@ impl SessionManager {
 
     pub fn close(&self, id: &str) {
         if let Some(mut session) = self.sessions.lock().unwrap().remove(id) {
-            // 标记 flow 已关闭：暂停自旋中的读线程靠这个（而不是 ack）退出，见
+            // 标记 flow 已关闭：暂停等待中的读线程靠这个（而不是 ack）退出，见
             // FlowWindow::close 的文档注释——remove 之后 ack 再也无法触达这个 flow，
-            // 不主动标记关闭的话，暂停中的读线程会永远等不到 should_resume()。
+            // 不主动标记关闭的话，暂停中的读线程会永远等不到恢复条件。
+            // 换成条件变量之后 `close()` 内部会 notify_all，所以这一行既是"改状态"
+            // 也是"发唤醒"，缺一个读线程就永远睡死在 wait 里。
             session.flow.close();
             // 主动杀子进程，让等待线程的 child.wait() 醒过来去发那唯一一次 session.exit。
             // 如果进程已经退出了（比如用户自己在 shell 里敲了 exit），kill 会失败，

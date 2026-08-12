@@ -2,22 +2,13 @@
 <html>
 <head>
 <style>
-  :root {
-    /*
-     * 日志区固定高度：约 10 行诊断文字（13px 等宽字体，行高约 16px）的
-     * 经验值，够看清最近几条埋点又不会把终端区挤没。不是压测出来的，
-     * 等真机反馈后再调——但无论调成多少都必须走这个变量，不能散落成
-     * 裸数值。
-     */
-    --log-height: 160px;
-  }
-
   /*
-   * 布局用 flex 纵向分两块：日志区固定高度 + 自己滚动，终端区吃掉剩余
-   * 空间。html/body 上的 overflow: hidden 保证页面本身不出现滚动条——
-   * 之前的 bug 是 <pre> 的默认 margin 会随日志行数增长，和 #terminal 的
-   * calc(100% - 2rem) 叠加超出视口，两者加起来超过 100% 才出现了页面级
-   * 滚动条，把终端下半截切掉。
+   * 终端独占整个窗口。原先这里还有一块固定高度 160px 的 #log 诊断日志区，
+   * 前提是"真机上用户没有 DevTools"；用户能开 DevTools 之后那块区域就只是
+   * 白占屏幕，日志已经改成只写 console（见 diagnostics/log.ts）。
+   *
+   * html/body 上的 overflow: hidden 保证页面本身不出现滚动条——历史上出过的
+   * bug 是子元素高度叠加超出视口，页面级滚动条把终端下半截切掉。
    */
   html, body {
     height: 100%;
@@ -28,30 +19,19 @@
     display: flex;
     flex-direction: column;
   }
-  #log {
-    flex: 0 0 var(--log-height);
-    margin: 0;
-    padding: 0.5em;
-    box-sizing: border-box;
-    overflow-y: auto;
-    overflow-x: hidden;
-    white-space: pre-wrap;
-    word-break: break-all;
-    /* 明确允许选中复制：用户要能把这块日志文本原样发回来排障。 */
-    user-select: text;
-  }
   #terminal {
     /*
-     * flex: 1 1 auto 让终端区吃掉除日志区外的全部剩余高度；min-height: 0
-     * 是必须的——flex 子项默认 min-height: auto，会被内容（xterm 的
-     * viewport）撑破容器而不是被压缩，导致 #terminal 实际高度超出可
-     * 分配空间，页面又会出现滚动条。这是标准的 flexbox 行为（子项默认
-     * min-height: auto），不是本项目特例。
+     * min-height: 0 在去掉日志区之后**仍然必须留着**，它防的不是"跟日志区抢
+     * 高度"，而是 flex 子项默认的 min-height: auto——那个默认值会让子项被自己
+     * 的内容（xterm 的 viewport）撑破容器而不是被压缩。缩小窗口时 FitAddon
+     * 重新量尺寸有一个时间差，这期间 xterm 的行数仍是旧的、内容比容器高，
+     * 没有这一行就会重新出现页面级滚动条。这是标准 flexbox 行为，跟同级还有
+     * 没有别的子项无关，所以不能顺手删掉。
      */
     flex: 1 1 auto;
     min-height: 0;
   }
 </style>
 </head>
-<body><pre id="log">booting…</pre><div id="terminal"></div><script type="module" src="./boot.ts"></script></body>
+<body><div id="terminal"></div><script type="module" src="./boot.ts"></script></body>
 </html>

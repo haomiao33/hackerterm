@@ -61,9 +61,32 @@ impl Core {
                     .encode_to_vec();
                     out_for_state("session.state", payload);
                 });
+                // 流控停摆自愈：读线程强制清零未确认窗口这件事必须让渲染层看见。
+                // 用一个独立的 topic 而不是塞进 session.state，理由见 proto 里
+                // SessionFlowStalledEvent 的注释：会话既没关也没失败，只是背压
+                // 被放弃了，报成 Failed 会误导渲染层以为会话死了。
+                let out_for_stall = self.outbound_clone_for_events();
+                let on_flow_stalled =
+                    Arc::new(move |sid: String, report: crate::session::FlowStallReport| {
+                        let payload = ht_proto::pb::SessionFlowStalledEvent {
+                            session_id: sid,
+                            unacknowledged_bytes: report.unacknowledged_bytes,
+                            stalled_ms: report.stalled_ms,
+                        }
+                        .encode_to_vec();
+                        out_for_stall("session.flow_stalled", payload);
+                    });
                 let id = self
                     .sessions
-                    .open(&r.shell, r.cols as u16, r.rows as u16, &r.cwd, on_exit, on_read_stopped)
+                    .open(
+                        &r.shell,
+                        r.cols as u16,
+                        r.rows as u16,
+                        &r.cwd,
+                        on_exit,
+                        on_read_stopped,
+                        on_flow_stalled,
+                    )
                     .map_err(|e| dispatch::err(ht_proto::pb::ErrorCode::ConnectFailed,
                                                "err.session.open_failed", e.to_string()))?;
                 Ok(SessionOpenResponse { session_id: id }.encode_to_vec())
@@ -100,6 +123,18 @@ impl Core {
                 // 避免这里再发一次导致重复事件（VS Code terminalProcess.ts 的单发射点模式）。
                 self.sessions.close(&r.session_id);
                 Ok(ht_proto::pb::Empty {}.encode_to_vec())
+            }
+            // 诊断快照。刻意做成请求-应答而不是周期性事件：这个数字平时没人关心，
+            // 只有在排查"数据怎么不来了"的时候才需要，而那种时刻用户是主动去查的
+            // （页面日志里有，DevTools 里也能随时再问一次）。做成周期推送等于把刚
+            // 从控制面上省下来的往返又加回去。
+            "core.stats" => {
+                // 请求体是空消息，解不出来也不影响回答——这里不做严格校验，
+                // 保持诊断接口在任何情况下都能答得上话。
+                Ok(ht_proto::pb::CoreStatsResponse {
+                    live_read_threads: self.live_read_threads() as u32,
+                }
+                .encode_to_vec())
             }
             other => Err(unknown_method(other)),
         }

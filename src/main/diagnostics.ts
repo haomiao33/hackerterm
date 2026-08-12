@@ -8,9 +8,10 @@ import { app } from 'electron'
  * 主导的故障类型恰恰是"静默失效"（屏幕上什么都不发生，也没有任何异常），
  * 这个缺口比任何单个 bug 都危险。
  *
- * 上报终点必须是渲染进程的页面日志区（#log）：真机上用户没有 DevTools，
- * 唯一能带回来的证据就是那块文字的截图或选中复制。同时无条件往 console
- * 打一份——渲染进程已经死了、或者还没建起来的时候，stderr 是仅存的出口。
+ * 上报终点是渲染进程的诊断日志（现在直接写它的 console，见
+ * src/ui/browser/diagnostics/log.ts）：三个进程的故障汇到同一处，排障时看一处
+ * 就够。同时无条件往主进程自己的 console 打一份——渲染进程已经死了、或者还没
+ * 建起来的时候，stderr 是仅存的出口。
  *
  * 时间线埋点（startup-timing.ts）走的是另一条 channel：那边是"什么时候发生
  * 了什么"的正常流水，这边是"出事了"，混在一起会让真正的故障淹没在流水里。
@@ -52,7 +53,7 @@ export class DiagnosticChannel {
     this.pending.push(line)
   }
 
-  /** 渲染进程就绪后调用一次：把之前攒的整批冲进页面日志区，之后实时直送。 */
+  /** 渲染进程就绪后调用一次：把之前攒的整批冲进页面诊断日志，之后实时直送。 */
   attach(target: Electron.WebContents): void {
     this.target = target
     for (const line of this.pending) target.send('diagnostic', line)
@@ -65,7 +66,7 @@ export class DiagnosticChannel {
  *
  * 装上处理器之后 Node 不再执行默认行为（打栈 + 退出），这是有意的取舍：打包
  * 后的 GUI 应用里"默认行为"等于整个进程无声消失，用户只看到窗口没了，什么
- * 证据都留不下。让它活着、把现场写进页面日志区，排障价值高得多。代价是进程
+ * 证据都留不下。让它活着、把现场写进页面诊断日志，排障价值高得多。代价是进程
  * 可能带着已损坏的状态继续跑，所以这两行日志必须写得足够醒目。
  */
 export function watchMainProcess(report: Report): void {
@@ -99,7 +100,7 @@ export function watchApp(report: Report): void {
 /**
  * 渲染进程主线程卡死 / 恢复。
  *
- * 卡死时页面完全不响应输入，但窗口还在、日志区还停在最后一条——从外面看跟
+ * 卡死时页面完全不响应输入，但窗口还在、日志还停在最后一条——从外面看跟
  * "数据不来了"一模一样，是最容易被误判成 IPC 断链的一类故障。成对记录
  * unresponsive/responsive，事后能直接读出卡了多久。
  */

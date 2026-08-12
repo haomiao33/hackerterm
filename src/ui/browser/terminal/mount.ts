@@ -33,6 +33,12 @@ declare global {
     __htDiagnostics?: {
       /** 已挂载的 xterm 实例，供端到端测试读屏幕缓冲区与挂时延埋点。 */
       term: Terminal
+      /**
+       * 向核心查一次存活读线程数并写进日志，返回那个数字（查询失败返回 -1）。
+       * 由 boot.ts 在数据端口就绪后补挂（这里只声明类型）——排查"数据怎么
+       * 不来了"时在 DevTools 里手动调，比只在固定几个时机打日志有用得多。
+       */
+      coreStats?: () => Promise<number>
     }
   }
 }

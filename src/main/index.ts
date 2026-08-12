@@ -71,7 +71,7 @@ ipcMain.on('request-control-port', (event) => {
   timing.record('main:control_port_request')
   // 页面既然能发出这个请求，就说明它的脚本已经执行完、诊断监听器已经挂好。
   // 这是"渲染进程能收消息了"最早也最准的判据，比 load 事件早近 80 秒，所以
-  // 攒着的启动时间线和故障日志都在这里冲进页面日志区。
+  // 攒着的启动时间线和故障日志都在这里冲进页面的诊断日志。
   timing.attach(event.sender)
   diagnostics.attach(event.sender)
 
@@ -105,8 +105,7 @@ ipcMain.on('open-data-port', (event, sessionId: string) => {
  * 把 GPU 各特性的启用/禁用状态打进同一条启动时间线。
  *
  * 排查冷启动慢的时候我们对 GPU 状态两眼一抹黑，只能靠反复加 `--disable-gpu`
- * 重启做对照实验；这一条直接把"硬件加速到底开没开、哪几项被禁"写进用户能
- * 截图带回来的日志区。终端是整屏重绘的场景，WebGL 有没有真的生效对观感的
+ * 重启做对照实验；这一条直接把"硬件加速到底开没开、哪几项被禁"写进诊断日志。终端是整屏重绘的场景，WebGL 有没有真的生效对观感的
  * 影响是数量级的。
  *
  * 放在 createWindow() 之后调用：这个 API 读的是 Chromium 已有的

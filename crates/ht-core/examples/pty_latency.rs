@@ -12,7 +12,7 @@
 //! 跑法：`cargo run -p ht-core --release --example pty_latency`
 //! 最后一行会打印 `PTY_LATENCY_JSON {"samples_ms":[...]}`，供 e2e/latency.ts 解析。
 
-use ht_core::session::{ReadStopReason, SessionManager};
+use ht_core::session::{FlowStallReport, ReadStopReason, SessionManager};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,6 +42,9 @@ fn main() {
             "",
             Arc::new(|_id, _code| {}),
             Arc::new(|_id, _reason: ReadStopReason| {}),
+            // 时延测量只写一个字节、立刻读回来，未确认字节数永远贴着 0，
+            // 流控停摆看门狗不可能触发；这里给个空回调即可。
+            Arc::new(|_id, _report: FlowStallReport| {}),
         )
         .expect("open pty session");
 

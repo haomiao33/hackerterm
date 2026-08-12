@@ -217,8 +217,8 @@ fn session_ack_is_routed_without_error() {
 ///    PowerShell 的 `while ($true) { 'hackerterm' }`）让某个会话持续产出，把未确认字节数推过高水位；
 /// 2. 只 ack 一部分，让未确认字节数落在「低水位 < x < 高水位」这个区间——
 ///    按文档，这个区间里读线程应该继续保持暂停；
-/// 3. 等一段远大于轮询间隔（`FLOW_PAUSE_POLL_INTERVAL_MS` = 2ms）的时间，
-///    看有没有新数据被读出来。有，就说明它错误地恢复了。
+/// 3. 等一段足够长的时间（读线程现在是条件变量阻塞等待，恢复由 ack 的 notify 推送，
+///    毫秒级就该生效），看有没有新数据被读出来。有，就说明它错误地恢复了。
 ///
 /// 高低水位阈值都从 `ht_core::limits` 读，不写死字面量——Task 7 压测会调它们。
 #[test]
@@ -301,7 +301,7 @@ fn read_thread_waits_for_low_water_before_resuming() {
         })),
     }));
 
-    // 轮询间隔是 2ms（FLOW_PAUSE_POLL_INTERVAL_MS）：500ms 远够让「正确实现」
+    // 恢复是条件变量推送的（ack 里 notify_all），毫秒级生效：500ms 远够让「正确实现」
     // 稳稳地停在暂停态，也远够让「有 bug 的实现」明显恢复读取并吐出大量新数据
     // （刷屏命令吐字节的速度远高于 500ms 内几 KB 的量级）。
     std::thread::sleep(Duration::from_millis(500));
@@ -423,7 +423,7 @@ fn closing_a_paused_session_terminates_its_read_thread() {
         })),
     }));
 
-    // 轮询等待读线程真正退出，最多给 3 秒——远比 500Hz 的轮询间隔（2ms）宽松，
+    // 轮询等待读线程真正退出，最多给 3 秒——close() 里的 notify_all 会立刻唤醒它，
     // 只要 close() 正确处理了暂停中的读线程，应该在毫秒级就降到 0。
     let close_deadline = std::time::Instant::now() + Duration::from_secs(3);
     let last_count = loop {
@@ -526,7 +526,7 @@ fn read_thread_resumes_after_enough_ack() {
         })),
     }));
 
-    // 给读线程足够时间被轮询唤醒并恢复读取（轮询间隔 2ms，500ms 绰绰有余）。
+    // 给读线程足够时间被 ack 的 notify 唤醒并恢复读取（条件变量推送，500ms 绰绰有余）。
     std::thread::sleep(Duration::from_millis(500));
     let n2 = total_bytes_for(&data, &sid);
 

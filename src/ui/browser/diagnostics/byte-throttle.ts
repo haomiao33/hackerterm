@@ -3,9 +3,8 @@ import { hexPreview } from './hex'
 
 /**
  * 一次按键落地的关键证据都在最初这几次 onData 里；超过这个次数后大概率
- * 已经证明了"键盘输入通路是通的"，继续逐条打印只会刷屏（挤掉别的埋点，
- * 见 index.html 固定高度日志区的约束），改成每隔 ONDATA_SUMMARY_INTERVAL
- * 次汇总一次即可。
+ * 已经证明了"键盘输入通路是通的"，继续逐条打印只会刷屏、把别的埋点挤出
+ * console 的可视范围，改成每隔 ONDATA_SUMMARY_INTERVAL 次汇总一次即可。
  */
 const ONDATA_FULL_LOG_COUNT = 20
 const ONDATA_SUMMARY_INTERVAL = 50
