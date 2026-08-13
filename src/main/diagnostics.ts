@@ -121,6 +121,24 @@ function isCoreHostErrorMessage(message: unknown): message is CoreHostErrorMessa
 }
 
 /**
+ * core-host 的同一次往返分段埋点（见 src/core-host/latency-trace.ts）。
+ *
+ * 这条消息**只在 core-host 进程带着 `HT_LATENCY_TRACE=1` 启动时才存在**，正常
+ * 运行一条都不会有。放在这条诊断通道上转发，是因为它已经通到渲染进程的 console
+ * 了——测量脚本从 Playwright 收到的 console 行里捞它，不必为一个默认关闭的测量
+ * 功能新建一条跨三个进程的通道。
+ */
+interface CoreHostLatencyMessage {
+  kind: 'latency'
+  line: string
+}
+
+function isCoreHostLatencyMessage(message: unknown): message is CoreHostLatencyMessage {
+  if (typeof message !== 'object' || message === null) return false
+  return (message as { kind?: unknown }).kind === 'latency'
+}
+
+/**
  * core（utility 进程）的故障。
  *
  * - `'error'`：不在文档列出的事件表里，但 UtilityProcess 是 EventEmitter，
@@ -136,6 +154,11 @@ export function watchCore(report: Report, core: Electron.UtilityProcess): void {
   core.on('error', (err: unknown) => report(`core error: ${formatError(err)}`))
   core.on('exit', (code) => report(`core exited: code=${code}（控制/数据端口自此静默失效）`))
   core.on('message', (message: unknown) => {
+    // 时延埋点：默认关闭，一行都不会有（见 CoreHostLatencyMessage 的注释）。
+    if (isCoreHostLatencyMessage(message)) {
+      report(message.line)
+      return
+    }
     if (!isCoreHostErrorMessage(message)) return
     report(`core-host ${message.detail}`)
   })

@@ -18,7 +18,8 @@
     "bench:arrow": "tsx bench/arrow.ts",
     "test": "vitest run src",
     "test:e2e": "node scripts/run-e2e.mjs",
-    "measure:latency": "tsx e2e/latency.ts"
+    "measure:latency": "node scripts/run-measure.mjs e2e/latency.ts",
+    "measure:shell-cost": "node scripts/run-measure.mjs e2e/shell-cost.ts"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.13.0",

@@ -1,8 +1,8 @@
 /**
- * 不经过 Electron，直接在普通 Node 进程里驱动一条真会话：
+ * 不经过 Electron，直接在普通 Node 进程里驱动真会话：
  * napi（ht-node）→ Rust Core → SessionManager → 真 PTY → 真 shell。
  *
- * 存在的理由有两个：
+ * 存在的理由有三个：
  *
  * 1. 补上 Electron 端到端测试在 Linux 上补不了的那一块。Linux 下 Electron 进程内
  *    fork PTY 子进程会被 Chromium 的 fd 归属检查打死（见 electron-app.ts 里
@@ -10,9 +10,14 @@
  *    普通 Node 进程里没有那个被 Chromium 覆盖过的 `close()`，shell 能正常起来，
  *    于是「命令真的执行、真的有输出」这件事在 Linux 上仍然有自动化断言兜底。
  *
- * 2. 它天然是时延分段测量里的一个测点：这条路径 = 完整链路减去两跳数据面
- *    MessagePort、减去 xterm 解析。跟渲染进程量到的整程往返一减，就能把
- *    「ConPTY/PTY 自己占多少」和「我们的 IPC 占多少」拆开（见 latency.ts）。
+ * 2. 它是时延测量的 NAPI 段：这条路径 = 完整链路减去两跳数据面 MessagePort、
+ *    减去 xterm 解析（见 latency.ts）。
+ *
+ * 3. 它让"同一条管道换一个从端程序"成为可能——`e2e/shell-cost.ts` 靠这一点在同
+ *    一个进程里同时开一条裸 PTY 会话和一条真 bash 会话，交替按键，量出 shell
+ *    自己占了多少。这就是 `connectCore()` 要跟 `openCoreSession()` 分开的原因：
+ *    `start()`/`start_data()` 在 Rust 侧是 OnceLock，**一个进程只能调一次**，
+ *    所以"连上核心"和"开一条会话"必须是两件事。
  */
 import {
   Envelope, Hello, SessionCloseRequest, SessionOpenRequest, SessionOpenResponse,
@@ -21,28 +26,49 @@ import {
 /** 协议请求的自增 id。核心按 id 配对响应，只要不重复就行。 */
 let nextRequestId = 1
 
+export interface SessionOptions {
+  cols?: number
+  rows?: number
+  /**
+   * PTY 从端跑什么程序。空串 = 核心的默认 shell（`session.rs::default_shell()`，
+   * 类 Unix 读 `$SHELL`、缺省 /bin/zsh；Windows 固定 powershell.exe）。
+   */
+  shell?: string
+}
+
 export interface CoreSession {
   sessionId: string
   /** 往 PTY 写字节（等价于渲染进程敲键）。 */
   write(bytes: Uint8Array): void
-  /** 注册 PTY 出向字节的回调。回调在 napi 线程安全函数上被调用。 */
+  /** 注册**这条会话**出向字节的回调。回调在 napi 线程安全函数上被调用。 */
   onData(cb: (bytes: Uint8Array) => void): void
-  /** 关掉会话，杀掉 shell 子进程。不关的话测试进程退出后会留下孤儿 shell。 */
+  /** 关掉会话，杀掉子进程。不关的话测试进程退出后会留下孤儿进程。 */
   close(): Promise<void>
+}
+
+export interface CoreConnection {
+  /** 在同一个核心上再开一条会话。可以开多条，出向数据按 sessionId 分流。 */
+  openSession(options?: SessionOptions): Promise<CoreSession>
 }
 
 type CoreModule = typeof import('ht-node')
 
+/** 进程内是否已经连过核心。第二次调用是编程错误，直接抛，不要等 Rust 侧的 OnceLock。 */
+let connected = false
+
 /**
- * 加载 ht-node、握手、开一条真会话。
+ * 加载 ht-node、握手，返回一个可以反复开会话的连接。
  *
- * 注意 `start()`/`start_data()` 在 Rust 侧是 OnceLock，**一个进程只能调一次**，
- * 所以这个函数每个进程只能调用一次；vitest 那边用 `pool: 'forks'` 保证每个测试
- * 文件独占一个进程。
+ * `start()`/`start_data()` 在 Rust 侧是 OnceLock，**一个进程只能调一次**，所以这
+ * 个函数每个进程只能调用一次；vitest 那边用 `pool: 'forks'` 保证每个测试文件独占
+ * 一个进程。
  */
-export async function openCoreSession(
-  { cols = 80, rows = 24 }: { cols?: number, rows?: number } = {},
-): Promise<CoreSession> {
+export async function connectCore(): Promise<CoreConnection> {
+  if (connected) {
+    throw new Error('connectCore() 一个进程只能调用一次（Rust 侧 start()/start_data() 是 OnceLock）')
+  }
+  connected = true
+
   // 类 Unix 下核心用 $SHELL 决定开哪个 shell，缺省回退 /bin/zsh 很多机器上没装，
   // 这里跟 Electron 那边保持同一个口径，钉死 bash。
   if (process.platform !== 'win32') process.env.SHELL ??= '/bin/bash'
@@ -53,12 +79,16 @@ export async function openCoreSession(
     resolve: (payload: Uint8Array) => void
     reject: (err: Error) => void
   }>()
-  const dataListeners: ((bytes: Uint8Array) => void)[] = []
+  // 按会话分流：多条会话同时开着时，把所有字节广播给所有监听器会让两条会话的
+  // 数据互相污染——而这正是 shell-cost.ts 那种"同时开两条会话交替按键"的用法。
+  const dataListeners = new Map<string, ((bytes: Uint8Array) => void)[]>()
 
   // 顺序很重要：start_data 必须在 start 之前（Rust 侧注释写死了这个契约）。
-  core.startData((_sessionId: string, buf: Buffer) => {
+  core.startData((sessionId: string, buf: Buffer) => {
+    const listeners = dataListeners.get(sessionId)
+    if (!listeners) return
     const bytes = new Uint8Array(buf)
-    for (const cb of dataListeners) cb(bytes)
+    for (const cb of listeners) cb(bytes)
   })
 
   core.start((buf: Buffer) => {
@@ -97,17 +127,28 @@ export async function openCoreSession(
     implVersion: 'e2e', capabilities: [],
   }).finish())
 
-  const openPayload = await request('session.open', SessionOpenRequest.encode({
-    shell: '', cols, rows, cwd: '',
-  }).finish())
-  const { sessionId } = SessionOpenResponse.decode(openPayload)
-
   return {
-    sessionId,
-    write: (bytes) => core.sendData(sessionId, Buffer.from(bytes)),
-    onData: (cb) => dataListeners.push(cb),
-    close: async () => {
-      await request('session.close', SessionCloseRequest.encode({ sessionId }).finish())
+    async openSession({ cols = 80, rows = 24, shell = '' }: SessionOptions = {}): Promise<CoreSession> {
+      const openPayload = await request('session.open', SessionOpenRequest.encode({
+        shell, cols, rows, cwd: '',
+      }).finish())
+      const { sessionId } = SessionOpenResponse.decode(openPayload)
+      dataListeners.set(sessionId, [])
+      return {
+        sessionId,
+        write: (bytes) => core.sendData(sessionId, Buffer.from(bytes)),
+        onData: (cb) => { dataListeners.get(sessionId)!.push(cb) },
+        close: async () => {
+          await request('session.close', SessionCloseRequest.encode({ sessionId }).finish())
+          dataListeners.delete(sessionId)
+        },
+      }
     },
   }
+}
+
+/** 连核心 + 开一条会话。只需要一条会话时用这个（每个进程同样只能调一次）。 */
+export async function openCoreSession(options: SessionOptions = {}): Promise<CoreSession> {
+  const core = await connectCore()
+  return core.openSession(options)
 }

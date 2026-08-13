@@ -39,7 +39,7 @@ export interface LaunchedApp {
  * 所以它出现就意味着**协议握手成功、session.open 成功、数据面 MessagePort
  * 两端都接好了**。等到它，后面敲键才有意义。
  */
-export async function launchApp(): Promise<LaunchedApp> {
+export async function launchApp(options: { env?: Record<string, string> } = {}): Promise<LaunchedApp> {
   if (!existsSync(MAIN_ENTRY)) {
     throw new Error(
       `找不到构建产物 ${MAIN_ENTRY}。端到端测试跑的是真实产物，请先执行：\n` +
@@ -52,6 +52,7 @@ export async function launchApp(): Promise<LaunchedApp> {
     cwd: REPO_ROOT,
     env: {
       ...process.env,
+      ...options.env,
       // 类 Unix 下核心用 $SHELL 决定开哪个 shell（crates/ht-core/src/session.rs
       // 的 default_shell），缺省回退是 /bin/zsh——很多 CI 镜像/容器里根本没装
       // zsh，会话就会开不起来。这里钉死 bash，让测试结果不受宿主环境影响。
@@ -60,13 +61,52 @@ export async function launchApp(): Promise<LaunchedApp> {
     },
   })
 
+  // 监听器要在 firstWindow() 之前挂：窗口一创建页面就开始打日志，晚一步注册就
+  // 丢掉最早那几行——而"启动阶段发生了什么"恰恰是排障时最想看的部分。
+  app.on('window', collectConsole)
+
   const page = await app.firstWindow()
+  collectConsole(page) // 幂等；万一 'window' 事件在 launch 返回前就发过了，这里补上
   await page.waitForFunction(
     () => Boolean(window.__htDiagnostics?.term),
     undefined,
     { timeout: MOUNT_TIMEOUT_MS },
   )
   return { app, page }
+}
+
+/**
+ * 每个页面收到的 console 输出。
+ *
+ * 用 WeakMap 挂在 Page 上而不是模块级数组：一次运行里可能开多个 app（时延测量
+ * 就会），日志混在一起等于没有。
+ */
+const consoleLines = new WeakMap<Page, string[]>()
+
+/**
+ * 上限。渲染进程刷屏时 console 能涨得很快，而排障要看的是**最近**发生了什么，
+ * 所以攒满丢最老的。
+ */
+const MAX_CONSOLE_LINES = 2000
+
+function collectConsole(page: Page): void {
+  if (consoleLines.has(page)) return
+  const lines: string[] = []
+  consoleLines.set(page, lines)
+  const push = (line: string): void => {
+    if (lines.length >= MAX_CONSOLE_LINES) lines.shift()
+    lines.push(line)
+  }
+  page.on('console', (msg) => push(`[${msg.type()}] ${msg.text()}`))
+  // 页面里没被捕获的异常不走 console，得单独收；boot.ts 的 installErrorHandlers
+  // 会把它写进日志，但那个处理器本身要是没装上（模块加载阶段就炸了）就只剩这条路。
+  page.on('pageerror', (err) => push(`[pageerror] ${err.stack ?? err.message}`))
+  page.on('crash', () => push('[crash] 渲染进程崩溃'))
+}
+
+/** 页面 console 收到的每一行（含主进程/core-host 经诊断通道转发进来的那些）。 */
+export function consoleLog(page: Page): string[] {
+  return consoleLines.get(page) ?? []
 }
 
 /**
@@ -115,9 +155,27 @@ export async function waitForScreen(
   }
 }
 
-/** 页面诊断日志区（#log）的全文，失败时打出来最能说明卡在链路哪一节。 */
+/**
+ * 页面诊断日志全文，断言失败时打出来最能说明卡在链路哪一节。
+ *
+ * 以前这里读的是页面上那块 `#log` 区（`document.getElementById('log')`）。**那个
+ * 元素已经不存在了**——诊断日志改成直接写 console（见
+ * src/ui/browser/diagnostics/log.ts），于是这个函数恒返回空串。测试没红，因为它
+ * 只出现在断言失败的报错文案里；代价是将来端到端一变红，"诊断日志："后面就是
+ * 一片空白，排障线索全没了。这正是本项目最典型的那种"看着对、不报错、就是不
+ * 工作"。
+ *
+ * 现在改成读 launchApp 装好的 console 收集器：页面自己的日志、window error /
+ * unhandledrejection、以及主进程和 core-host 经诊断通道转发进来的那几类故障
+ * （见 src/main/diagnostics.ts）全在里面，比原来那块 DOM 日志区更全。
+ */
 export async function readDiagnosticLog(page: Page): Promise<string> {
-  return page.evaluate(() => document.getElementById('log')?.textContent ?? '')
+  const lines = consoleLog(page)
+  // 保持 async 签名：调用点都是 `await readDiagnosticLog(page)`，将来若要再从
+  // 页面里捞点别的（比如屏幕内容）也用得上。
+  return Promise.resolve(
+    lines.length > 0 ? lines.join('\n') : '（页面 console 一行都没有——渲染进程可能压根没跑起来）',
+  )
 }
 
 /**

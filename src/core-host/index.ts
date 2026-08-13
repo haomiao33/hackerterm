@@ -1,5 +1,6 @@
 import { DataBatcher } from '../ui/common/data-batcher'
 import { SessionDataBuffer } from '../ui/common/session-data-buffer'
+import { LATENCY_TRACE_ENABLED, LatencyTrace } from './latency-trace'
 
 // 本文件（core-host 入口模块）开始执行的时刻：全链路时间线里 core-host
 // 这一侧最早能拿到的点，用来跟下面 ht-node 原生模块的加载耗时对比。时间
@@ -34,6 +35,16 @@ const dataBuffer = new SessionDataBuffer()
  * 是另一件事（别把最早那批输出丢了），两者职责不重叠，串起来即可。
  */
 const dataBatchers = new Map<string, DataBatcher>()
+
+/**
+ * 同一次往返内的分段埋点，**默认是 null**（见 latency-trace.ts）。
+ *
+ * 为 null 时下面数据面的两个处理函数注册的是不含任何埋点的原版，热路径上零开销；
+ * 非 null 时才注册包了一层的版本。开关只在这里判一次，不在每条消息上判。
+ */
+const latencyTrace = LATENCY_TRACE_ENABLED
+  ? new LatencyTrace((line) => process.parentPort.postMessage({ kind: 'latency', line }))
+  : null
 
 function batcherFor(sessionId: string): DataBatcher {
   let batcher = dataBatchers.get(sessionId)
@@ -110,7 +121,17 @@ async function bootCoreHost(): Promise<void> {
       port.start()
     } else if (e.data?.kind === 'data') {
       const { sessionId } = e.data
-      dataBuffer.attach(sessionId, (data) => port.postMessage(data))
+      // 出向：字节离开 core-host 的那一刻。埋点版**先把数据发出去、再上报**——
+      // 上报本身要走一次 parentPort，那点开销要是排在 postMessage 前面，就会被
+      // 算进渲染进程量到的整程里，等于测量把被测对象改慢了。
+      const emitOutbound = (data: Uint8Array): void => { port.postMessage(data) }
+      dataBuffer.attach(sessionId, latencyTrace
+        ? (data) => {
+          const at = performance.now()
+          emitOutbound(data)
+          latencyTrace.outbound(at)
+        }
+        : emitOutbound)
       // 会话结束时要 detach，否则 dataBuffer 内部的 Map 会随会话数量无限增长
       // （泄漏）。MessagePortMain 在另一端（渲染进程的 dataPort）关闭或整个
       // utility 进程销毁时会触发自己的 'close' 事件——这比等一条协议层面的
@@ -126,7 +147,8 @@ async function bootCoreHost(): Promise<void> {
         dataBatchers.get(sessionId)?.dispose()
         dataBatchers.delete(sessionId)
       })
-      port.on('message', (m) => {
+      // 入向：渲染进程的按键字节到达 core-host 的那一刻。
+      const forwardInbound = (m: Electron.MessageEvent): void => {
         // 渲染侧发的是 Uint8Array 且不带 transfer（见 boot.ts 里那段注释），
         // 经 structured clone 到这边原样还是 Uint8Array——原来写 `as ArrayBuffer`
         // 是错的，而 Electron 把 MessageEvent.data 声明成 any，强断言根本没被
@@ -135,7 +157,14 @@ async function bootCoreHost(): Promise<void> {
         // 错时 tsc 会在下游用法上报出来，不再被 as 压掉。
         const bytes: Uint8Array = m.data
         sendData(sessionId, Buffer.from(bytes))
-      })
+      }
+      port.on('message', latencyTrace
+        ? (m) => {
+          const at = performance.now()
+          forwardInbound(m)
+          latencyTrace.inbound(at)
+        }
+        : forwardInbound)
       port.start()
     }
   })
