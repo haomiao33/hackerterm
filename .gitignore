@@ -7,3 +7,7 @@ out/
 # 工作区根目录生成这两个文件；本地照着跑一遍也会）。是测量产物，不入库。
 latency-conpty.log
 latency-full.log
+# 自托管 GitHub Actions runner 的安装目录。**绝不能入库**：`config.cmd` 跑完
+# 之后这里会生成 `.credentials` 和 `.runner`，里面是这台机器向 GitHub 认证用的
+# 令牌；提交上去等于把「谁都能冒充这台 runner」写进公开仓库。zip 本身也有上百 MB。
+actions-runner/
