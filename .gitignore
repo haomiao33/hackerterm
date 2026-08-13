@@ -11,3 +11,10 @@ latency-full.log
 # 之后这里会生成 `.credentials` 和 `.runner`，里面是这台机器向 GitHub 认证用的
 # 令牌；提交上去等于把「谁都能冒充这台 runner」写进公开仓库。zip 本身也有上百 MB。
 actions-runner/
+# 视觉回归失败时落盘的实际图/差异图（e2e/screenshot.ts 写的）。基线本身
+# （e2e/__screenshots__/*.png）**要入库**——它是测试的判据；这个子目录是每次
+# 失败现生成的排障产物，不入库，由 CI 当 artifact 上传。
+e2e/__screenshots__/__artifacts__/
+# 自托管 runner 诊断 job 在工作区根生成的原始产物（同样由 CI 当 artifact 上传）。
+env-facts.tsv
+startup-timeline.md

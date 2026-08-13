@@ -20,7 +20,8 @@
  *    所以"连上核心"和"开一条会话"必须是两件事。
  */
 import {
-  Envelope, Hello, SessionCloseRequest, SessionOpenRequest, SessionOpenResponse,
+  Envelope, Hello, SessionAckRequest, SessionCloseRequest, SessionOpenRequest, SessionOpenResponse,
+  SessionSignalRequest, Signal,
 } from '../src/ui/common/protocol/hackerterm'
 
 /** 协议请求的自增 id。核心按 id 配对响应，只要不重复就行。 */
@@ -42,6 +43,20 @@ export interface CoreSession {
   write(bytes: Uint8Array): void
   /** 注册**这条会话**出向字节的回调。回调在 napi 线程安全函数上被调用。 */
   onData(cb: (bytes: Uint8Array) => void): void
+  /**
+   * 确认消费了 `bytesConsumed` 字节，等价于渲染层 `AckBatcher` 冲刷时发的那条
+   * `session.ack`。
+   *
+   * 为什么测试也必须发 ack：核心的流控窗口（`flow.rs`）只认 ack。不发 ack 的
+   * 消费方在核心眼里等于"一个字节都没消费"，未确认量涨过高水位后读线程直接
+   * 暂停，五秒后看门狗强制清零窗口（`session.flow_stalled`）——量出来的既不是
+   * 真实吞吐，也不是真实的水位行为，而是一条**永远处于降级路径**的假链路。
+   * 压测要检验的恰恰是 1MiB/256KiB 这对水位在**正常 ack 节奏**下到底管不管用，
+   * 所以这里必须把渲染层那半边补上。
+   */
+  ack(bytesConsumed: number): Promise<void>
+  /** 发一次中断（`session.signal` + SIGNAL_INT，核心侧就是往 PTY 写 0x03）。 */
+  signalInt(): Promise<void>
   /** 关掉会话，杀掉子进程。不关的话测试进程退出后会留下孤儿进程。 */
   close(): Promise<void>
 }
@@ -49,6 +64,16 @@ export interface CoreSession {
 export interface CoreConnection {
   /** 在同一个核心上再开一条会话。可以开多条，出向数据按 sessionId 分流。 */
   openSession(options?: SessionOptions): Promise<CoreSession>
+  /**
+   * 订阅核心主动推的事件（`session.exit` / `session.state` /
+   * `session.flow_stalled`），回调拿到的是**未解码**的 payload。
+   *
+   * 压测需要它的理由很具体：`session.flow_stalled` 是"我们刚刚放弃了一次背压"
+   * 的自白书。一次刷屏压测如果吞吐漂亮但中途报了 flow_stalled，说明水位其实
+   * 没起作用、是看门狗在兜底——那个数字不能拿来给水位背书。所以压测必须能
+   * 看见这个事件，而不能只看收了多少字节。
+   */
+  onEvent(topic: string, cb: (payload: Uint8Array) => void): void
 }
 
 type CoreModule = typeof import('ht-node')
@@ -91,9 +116,17 @@ export async function connectCore(): Promise<CoreConnection> {
     for (const cb of listeners) cb(bytes)
   })
 
+  // 事件订阅表。默认没人订阅，行为跟以前一样（事件被忽略）。
+  const eventListeners = new Map<string, ((payload: Uint8Array) => void)[]>()
+
   core.start((buf: Buffer) => {
     const env = Envelope.decode(new Uint8Array(buf))
-    // 只关心响应；session.exit / session.state 这些事件这里用不到，直接忽略。
+    if (env.event) {
+      for (const cb of eventListeners.get(env.event.topic) ?? []) {
+        cb(env.event.payload ?? new Uint8Array())
+      }
+      return
+    }
     if (!env.response) return
     const waiter = pending.get(env.response.id)
     if (!waiter) return
@@ -128,6 +161,11 @@ export async function connectCore(): Promise<CoreConnection> {
   }).finish())
 
   return {
+    onEvent(topic, cb) {
+      const list = eventListeners.get(topic)
+      if (list) list.push(cb)
+      else eventListeners.set(topic, [cb])
+    },
     async openSession({ cols = 80, rows = 24, shell = '' }: SessionOptions = {}): Promise<CoreSession> {
       const openPayload = await request('session.open', SessionOpenRequest.encode({
         shell, cols, rows, cwd: '',
@@ -138,6 +176,14 @@ export async function connectCore(): Promise<CoreConnection> {
         sessionId,
         write: (bytes) => core.sendData(sessionId, Buffer.from(bytes)),
         onData: (cb) => { dataListeners.get(sessionId)!.push(cb) },
+        ack: async (bytesConsumed) => {
+          await request('session.ack', SessionAckRequest.encode({ sessionId, bytesConsumed }).finish())
+        },
+        signalInt: async () => {
+          await request('session.signal', SessionSignalRequest.encode({
+            sessionId, signal: Signal.SIGNAL_INT,
+          }).finish())
+        },
         close: async () => {
           await request('session.close', SessionCloseRequest.encode({ sessionId }).finish())
           dataListeners.delete(sessionId)
