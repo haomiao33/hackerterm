@@ -18,7 +18,9 @@
     "bench:arrow": "tsx bench/arrow.ts",
     "test": "vitest run src",
     "test:e2e": "node scripts/run-e2e.mjs",
+    "test:e2e:update-screenshots": "node scripts/update-screenshots.mjs",
     "measure:latency": "node scripts/run-measure.mjs e2e/latency.ts",
+    "measure:startup": "node scripts/run-measure.mjs e2e/startup-timeline.ts",
     "measure:shell-cost": "node scripts/run-measure.mjs e2e/shell-cost.ts"
   },
   "dependencies": {
@@ -30,12 +32,15 @@
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
+    "@types/pngjs": "^6.0.5",
     "apache-arrow": "^21.2.0",
     "electron": "^43.3.0",
     "electron-builder": "^26",
     "electron-vite": "^5.0.0",
     "eslint": "^10.8.1",
+    "pixelmatch": "^7.2.0",
     "playwright-core": "^1.62.1",
+    "pngjs": "^7.0.0",
     "ts-proto": "^2.2.0",
     "tsx": "^4.23.12",
     "typescript": "^5.9.3",

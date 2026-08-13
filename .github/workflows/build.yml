@@ -142,13 +142,20 @@ jobs:
       # Electron 在 headless Linux 上要有 X 服务器（xvfb）和一组 Chromium 运行时
       # 共享库。GitHub 的 ubuntu 镜像大多已自带，这里显式装一遍，免得哪天换了镜像
       # 就以"Missing X server or $DISPLAY"这种和本项目毫无关系的错误红掉。
-      - name: Install Electron runtime deps (xvfb + Chromium shared libs)
+      #
+      # fonts-dejavu-core 是**视觉回归**（e2e/visual.e2e.ts）唯一的外部前提：
+      # 基线截图在 DejaVu Sans Mono 下生成，e2e/fixtures/fonts.conf 通过
+      # FONTCONFIG_FILE 把字体解析钉死到这一个文件，否则 `monospace` 会随机器
+      # 装了什么字体而变，基线永远对不上。装不上的话视觉回归会**跳过**（不是
+      # 失败）——那两个真实发生过的渲染故障就重新失去防线，所以这一步必须成功。
+      - name: Install Electron runtime deps (xvfb + Chromium shared libs + 视觉回归字体)
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             xvfb libgbm1 libnss3 libatk1.0-0 libatk-bridge2.0-0 \
             libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
-            libxfixes3 libxrandr2 libpango-1.0-0 libcairo2 libasound2t64
+            libxfixes3 libxrandr2 libpango-1.0-0 libcairo2 libasound2t64 \
+            fonts-dejavu-core
 
       - name: Install dependencies (pnpm install, retry x3)
         run: |
@@ -171,6 +178,17 @@ jobs:
       # xvfb-run -a：自动挑一个没被占用的 display 号。
       - name: E2E smoke (Playwright + real Electron + real PTY)
         run: xvfb-run -a pnpm test:e2e
+
+      # 视觉回归红了之后，唯一有用的信息是"哪几个像素不一样"，而那只能看图。
+      # if: failure() —— 只在真红的时候传，绿的时候这个目录压根不存在。
+      # 路径与 build job 的 release/*.zip 完全无关，不影响用户下载安装包。
+      - name: Upload visual diff artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-diff-linux
+          path: e2e/__screenshots__/__artifacts__/
+          if-no-files-found: ignore
 
   # ────────────────────────────────────────────────────────────────
   # smoke-windows：同一套端到端冒烟，跑在产品的**正式目标平台**上。
@@ -404,6 +422,263 @@ jobs:
           path: |
             latency-conpty.log
             latency-full.log
+          if-no-files-found: warn
+
+  # ────────────────────────────────────────────────────────────────
+  # selfhosted-diagnose：自托管 runner（用户自己的 Win11 笔记本）的**环境诊断**。
+  #
+  # 这个 job 不测代码，测的是**那台机器**。要回答的问题只有一个：
+  # 「装成 Windows 服务、跑在 NT AUTHORITY\NETWORK SERVICE 名下的这个 runner，
+  #   到底能替我们验证什么，不能验证什么？」
+  # 现在只能靠猜（"Session 0 大概没有桌面吧"），而猜出来的结论会直接影响我们
+  # 把哪些测试放上去、又相信它们到什么程度。所以让机器自己把事实打印出来。
+  #
+  # 最有价值的一项是**真实冷启动耗时**：用户真机上 `main:fork_call →
+  # main:core_spawn` 这一段曾经是 81 秒，关掉杀毒后掉到 504ms。那一轮排查是靠人
+  # 反复下载安装包手动开、一轮一天查出来的。这里用 `pnpm measure:startup`
+  # （e2e/startup-timeline.ts）把同一段变成可持续观测的自动化口径——**复用的是
+  # 现成的埋点**（src/main/startup-timing.ts + 页面诊断日志），没有另起一套。
+  #
+  # ── 【安全门禁】if: github.event_name != 'pull_request' ──────────────────
+  # 这一行是**必须的**，不是可选优化。本仓库是**公开仓库**，而自托管 runner
+  # 默认会接 fork 过来的 PR 的任务——也就是说，任何陌生人只要发一个 PR，改一行
+  # workflow 或者往测试里塞一句命令，就能在用户自己的笔记本上执行任意代码
+  # （读文件、拿凭据、装东西）。GitHub 官方文档在 "Self-hosted runner security"
+  # 里明确写了不建议公开仓库使用自托管 runner，正是这个原因。
+  # 用户选择接受这个风险并自己把关 PR，这条事件门禁是**纯代码层面的补充保险**：
+  # 就算哪天仓库设置被改回"允许 fork PR 跑 workflow"，这一行仍然会让所有
+  # pull_request 事件跳过本 job。
+  # **今后任何新增的 runs-on: self-hosted 的 job 都必须照抄这一行。**
+  #
+  # ── 【continue-on-error: true，加在 job 上】理由 ────────────────────────
+  # 这是一台**个人笔记本**，会关机、会合盖、会断网。runner 离线时这个 job 会一直
+  # 排队直到超时，超时就是失败——而那种失败说明的是"笔记本没开机"，不是"代码坏
+  # 了"，绝不该拦住任何别人的合并。所以整个 job 挂 continue-on-error。
+  # 同时配 timeout-minutes，免得离线时挂满 6 小时默认上限白占额度。
+  # 它跟 verify 那种"预期会红"的定位也不一样：这个 job 预期会绿，只是**预期
+  # 可能压根跑不起来**。红绿灯仍然是 smoke / smoke-windows。
+  # ────────────────────────────────────────────────────────────────
+  selfhosted-diagnose:
+    name: self-hosted 环境诊断 (DESKTOP-8GCTKR2)
+    runs-on: [self-hosted, Windows, X64]
+    if: github.event_name != 'pull_request'
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 事实采集①：我是谁、跑在哪个会话里 ──────────────────────────
+      # 全部包 try/catch：NETWORK SERVICE 权限受限，任何一条查询都可能被拒，
+      # 而"这条查不到"本身就是有用的结论，不该让整步炸掉把其余事实一起带走。
+      - name: 采集运行环境事实
+        id: facts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = New-Object System.Collections.Generic.List[string]
+          function Add-Fact($k, $v) { $out.Add("$k`t$v") }
+
+          Add-Fact 'whoami' (whoami)
+          Add-Fact 'machine' $env:COMPUTERNAME
+          Add-Fact 'session_id' (Get-Process -Id $PID).SessionId
+          Add-Fact 'user_interactive' ([Environment]::UserInteractive)
+          Add-Fact 'os' (Get-CimInstance Win32_OperatingSystem).Caption
+          Add-Fact 'cpu' (Get-CimInstance Win32_Processor).Name
+          Add-Fact 'cores' ([Environment]::ProcessorCount)
+          Add-Fact 'ram_gb' ([math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1))
+
+          # 窗口站 / 桌面：Session 0 的服务进程拿到的是非交互式窗口站
+          # （典型名字 Service-0x0-3e4$），它没有可见桌面。这是"能不能做真·桌面
+          # UI 自动化"的直接判据，所以值得为它写一段 P/Invoke 而不是靠推断。
+          # 注意：这里刻意**不用 PowerShell 的 here-string**（@'...'@）。
+          # here-string 的结束符 '@ 必须顶格写在行首，而 YAML 的块标量要求所有
+          # 内容缩进都比 `run:` 深——两个规则直接打架，写成 here-string 会让整个
+          # workflow 文件 YAML 解析失败（已实测踩到）。改成字符串数组 join，
+          # 缩进随便加，两边都满意。
+          try {
+            $sig = @(
+              '[DllImport("user32.dll")]',
+              'public static extern IntPtr GetProcessWindowStation();',
+              '[DllImport("user32.dll")]',
+              'public static extern IntPtr GetThreadDesktop(uint dwThreadId);',
+              '[DllImport("kernel32.dll")]',
+              'public static extern uint GetCurrentThreadId();',
+              '[DllImport("user32.dll", CharSet = CharSet.Unicode)]',
+              'public static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);'
+            ) -join [Environment]::NewLine
+            Add-Type -Namespace HT -Name U -MemberDefinition $sig -UsingNamespace System.Runtime.InteropServices, System.Text
+            $sb = New-Object System.Text.StringBuilder 256
+            $n = 0
+            # nIndex = 2 (UOI_NAME)
+            [void][HT.U]::GetUserObjectInformation([HT.U]::GetProcessWindowStation(), 2, $sb, 256, [ref]$n)
+            Add-Fact 'window_station' $sb.ToString()
+            $sb2 = New-Object System.Text.StringBuilder 256
+            [void][HT.U]::GetUserObjectInformation([HT.U]::GetThreadDesktop([HT.U]::GetCurrentThreadId()), 2, $sb2, 256, [ref]$n)
+            Add-Fact 'desktop' $sb2.ToString()
+          } catch { Add-Fact 'window_station' "查询失败: $($_.Exception.Message)" }
+
+          # 显示器 / 显卡：Session 0 里通常一个显示器都枚举不到，这正是要记录的。
+          try {
+            $gpus = (Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }) -join '; '
+            Add-Fact 'video_controllers' $(if ($gpus) { $gpus } else { '(无)' })
+          } catch { Add-Fact 'video_controllers' "查询失败: $($_.Exception.Message)" }
+          try {
+            $mons = @(Get-CimInstance Win32_DesktopMonitor).Count
+            Add-Fact 'desktop_monitors' $mons
+          } catch { Add-Fact 'desktop_monitors' "查询失败: $($_.Exception.Message)" }
+
+          # Defender：冷启动那 81 秒的头号嫌疑人，必须记录它此刻的状态和排除项。
+          try {
+            $mp = Get-MpComputerStatus
+            Add-Fact 'defender_realtime' $mp.RealTimeProtectionEnabled
+            Add-Fact 'defender_engine' $mp.AMEngineVersion
+          } catch { Add-Fact 'defender_realtime' "查询失败（NETWORK SERVICE 多半没权限）: $($_.Exception.Message)" }
+          try {
+            $pref = Get-MpPreference
+            $ex = ($pref.ExclusionPath -join '; ')
+            Add-Fact 'defender_exclusions' $(if ($ex) { $ex } else { '(无)' })
+          } catch { Add-Fact 'defender_exclusions' "查询失败: $($_.Exception.Message)" }
+
+          Add-Fact 'workspace' $env:GITHUB_WORKSPACE
+          $out | ForEach-Object { $_ } | Out-File -FilePath env-facts.tsv -Encoding utf8
+          Get-Content env-facts.tsv
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies (pnpm install, retry x3)
+        shell: bash
+        run: |
+          for i in 1 2 3; do
+            pnpm install --frozen-lockfile && exit 0
+            echo "pnpm install failed (attempt $i/3), retrying in 5s..."
+            sleep 5
+          done
+          echo "pnpm install failed after 3 attempts"
+          exit 1
+
+      - name: Build native module (napi-rs)
+        id: build_native
+        continue-on-error: true
+        run: pnpm build:native
+
+      - name: Build Electron app
+        id: build_app
+        continue-on-error: true
+        run: pnpm build
+
+      # ── 事实采集②：真实冷启动耗时（本 job 最有价值的一项） ──────────────
+      # 跑的是真实构建产物，用的是现成埋点。5 轮取中位数：单轮受实时扫描/缓存
+      # 影响很大，一个数字说明不了问题。
+      - name: 冷启动时间线（pnpm measure:startup）
+        id: startup
+        continue-on-error: true
+        shell: bash
+        env:
+          HT_STARTUP_RUNS: 5
+        run: pnpm measure:startup 2>&1 | tee startup-timeline.md
+
+      # ── 事实采集③：Electron 到底能不能在这个环境下真的起来 ──────────────
+      # 直接跑现有的端到端冒烟。它比任何环境查询都有说服力：能跑通就说明
+      # Playwright 经 CDP 驱动 Electron 这条路不受 Session 0 影响（页面输入走
+      # Input.dispatchKeyEvent，不需要可见桌面）。
+      - name: E2E smoke（现有冒烟测试，判断 Electron 能否真的启动）
+        id: smoke
+        continue-on-error: true
+        run: pnpm test:e2e
+
+      # ── 汇总成人能一眼看懂的表格 ──────────────────────────────────────
+      # if: always()：上面任何一步挂了都要出报告，而且"挂了"本身就是结论。
+      - name: 写入运行摘要
+        if: always()
+        shell: pwsh
+        run: |
+          $S = $env:GITHUB_STEP_SUMMARY
+          function W($t) { Add-Content -Path $S -Value $t }
+
+          W '## 自托管 runner 环境诊断'
+          W ''
+          W '这个 job 不测代码，测的是**跑它的那台机器**：它到底能替我们验证什么。'
+          W ''
+
+          W '### 一、运行身份与会话'
+          W ''
+          W '| 项 | 值 |'
+          W '| --- | --- |'
+          if (Test-Path env-facts.tsv) {
+            Get-Content env-facts.tsv | ForEach-Object {
+              $p = $_ -split "`t", 2
+              if ($p.Count -eq 2) { W ('| `' + $p[0] + '` | ' + $p[1] + ' |') }
+            }
+          } else {
+            W '| — | 事实采集步骤没有产出文件（它自己失败了） |'
+          }
+          W ''
+
+          W '### 二、各步骤结果'
+          W ''
+          W '| 步骤 | 结果 | 说明 |'
+          W '| --- | --- | --- |'
+          W ('| build:native (napi-rs) | ' + '${{ steps.build_native.outcome }}' + ' | Rust 原生模块能不能在这台机器上编出来 |')
+          W ('| build (electron-vite) | ' + '${{ steps.build_app.outcome }}' + ' | |')
+          W ('| 冷启动时间线 | ' + '${{ steps.startup.outcome }}' + ' | 详见下面第三节 |')
+          W ('| E2E 冒烟 | ' + '${{ steps.smoke.outcome }}' + ' | **Electron 能不能在 Session 0 里真的起来并跑完键盘→PTY→屏幕** |')
+          W ''
+
+          W '### 三、真实冷启动耗时'
+          W ''
+          if (Test-Path startup-timeline.md) {
+            Get-Content startup-timeline.md | ForEach-Object { W $_ }
+          } else {
+            W '> 未产出。测量步骤失败了，看上面的 job 日志。'
+          }
+          W ''
+
+          W '### 四、哪些结论可信、哪些不可信'
+          W ''
+          W '这台 runner 装成了 **Windows 服务**，账户是 `NT AUTHORITY\NETWORK SERVICE`，'
+          W '因此跑在 **Session 0**——没有交互式桌面会话，也不是用户自己的账户。'
+          W '这直接决定了上面哪些数字能外推到"用户双击图标时的体验"：'
+          W ''
+          W '| 项 | 可信度 | 为什么 |'
+          W '| --- | --- | --- |'
+          W '| Electron 能否启动 / 冒烟能否跑通 | ✅ **可信** | Playwright 经 CDP 驱动页面（`Input.dispatchKeyEvent`），不需要可见桌面或窗口焦点，Session 0 不影响。跑通即证明这条路可用 |'
+          W '| 原生模块编译、依赖安装 | ✅ **可信** | 纯文件与编译器操作，跟会话无关 |'
+          W '| 冷启动**分段结构**（哪一段占大头） | 🟡 **参考** | 同一台机器上的趋势有意义，可以用来发现"某一段忽然涨了" |'
+          W '| 冷启动**绝对毫秒数** | ❌ **不可外推到用户真机** | 三个原因：① Defender 的实时扫描策略按**账户/路径**生效，NETWORK SERVICE 与用户账户不同；② 这里跑的是 CI 工作目录里**现编出来的**文件，而用户跑的是从浏览器下载、带 Mark-of-the-Web 的 zip 解压产物——后者才是当初触发 81 秒扫描的那种文件；③ 没有桌面合成器参与 |'
+          W '| GPU 特性状态 | ❌ **不可信** | Session 0 没有可见桌面、通常也枚举不到显示器，Chromium 必然落到软件渲染。用户真机是双显示器 + 真显卡，两者没有可比性 |'
+          W '| 窗口/焦点/DPI/字体渲染相关的一切 | ❌ **不可信** | 非交互式窗口站上根本没有这些东西 |'
+          W '| 多显示器相关行为 | ❌ **测不了** | 见上 |'
+          W ''
+          W '**要拿到真正代表用户体验的冷启动数字，只有一条路**：在用户自己的桌面会话里、'
+          W '用从 Actions 下载下来的 zip 解压后的产物跑一次。把 runner 改成以用户账户登录'
+          W '运行（而不是服务）可以让上面的 🟡/❌ 变成 ✅，但那要求笔记本保持登录状态。'
+
+      - name: 上传原始诊断产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhosted-diagnostics
+          path: |
+            env-facts.tsv
+            startup-timeline.md
           if-no-files-found: warn
 
   # ────────────────────────────────────────────────────────────────
