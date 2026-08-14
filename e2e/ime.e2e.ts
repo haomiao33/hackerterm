@@ -36,8 +36,23 @@ const COMPOSING_HANZI = '你好'
 /** 最终上屏的文字。 */
 const COMMITTED = '你好'
 
-/** 每一步之后给 IPC 往返留的时间。回显要走完整链路，比纯页面事件慢。 */
+/**
+ * 每一步之后给 IPC 往返留的时间。回显要走完整链路，比纯页面事件慢。
+ *
+ * 只用在"接下来要断言**什么都没发生**"的地方（组词中间态不许发字节）——那种
+ * 断言天然只能靠等一段时间来立论，没有可等的判据。凡是断言"某件事发生了"的
+ * 地方一律改用 `waitForSnapshot` 等判据，不要再用这个常量。
+ */
 const SETTLE_MS = 600
+
+/**
+ * 等一次真实回显走完屏幕的上限。
+ *
+ * 给得比 SETTLE_MS 宽两个量级，是因为它要覆盖 Windows 冷启动：ConPTY 起
+ * conhost + PowerShell 启动 + PSReadLine 加载，叠加 Defender 实时扫描能到几十秒。
+ * 这只是**上限**不是固定等待，判据一满足立刻往下走。
+ */
+const ECHO_TIMEOUT_MS = 60_000
 
 let app: ElectronApplication
 let page: Page
@@ -70,7 +85,7 @@ afterAll(async () => {
 })
 
 /**
- * xterm **自动回复**的形状：光标位置报告（CPR，`ESC[行;列R`）和设备属性（DA）。
+ * xterm **自动回复**的判据：**以 ESC(0x1b) 开头**。
  *
  * 为什么必须把它们滤掉：`term.onData` 不只在用户输入时触发——xterm 收到终端
  * 查询会自动回话，而 **PSReadLine 每次重绘都会问一次光标位置**（`ESC[6n`）。
@@ -78,9 +93,27 @@ afterAll(async () => {
  * 就是因为把这些自动回复当成了按键，Windows 上 60 次按键量出 61 个样本。
  * 本文件的断言是"上屏恰好发一次、退格恰好发一次"，Linux 上没有 shell 所以
  * 没人问光标位置，看着一切正常；到了 Windows（真 PowerShell + PSReadLine）
- * 就会平白多出若干条 `ESC[..;..R`，断言凭空变红——而那跟输入法一点关系都没有。
+ * 就会平白多出若干条自动回复，断言凭空变红——而那跟输入法一点关系都没有。
+ *
+ * ── 判据为什么从 `/^\x1b\[[\d;]*[Rc]$/` 放宽到"以 ESC 开头" ────────────────
+ * 原来那条只认 CPR（`…R`）和 DA（`…c`）两种，是**按名单堵**。名单漏了的那些
+ * 立刻就咬人了：Windows CI 上 e2e/latency-pairing.e2e.ts 红掉，日志里第一条
+ * 非按键 onData 是 `1b 5b 49` = `ESC[I`，**焦点上报**（DEC 私有模式 1004，真
+ * PowerShell 自己会开）——它不以 R 或 c 结尾，会被这条正则放行，于是本文件那几条
+ * `toHaveLength(0)` / `toHaveLength(1)` 在 Windows 上就是一颗定时炸弹。
+ *
+ * 现在改成类级判据：xterm 会主动写进 onData 的东西**无一例外都是 ANSI 控制
+ * 序列**（CSI `ESC[` 或 DCS `ESC P`）——CPR / DECXCPR / DA1 / DA2 / DSR /
+ * DECRPM / 窗口操作 / 鼠标上报 / 焦点上报 / 括号粘贴，完整名单与源码出处见
+ * e2e/latency-probe.ts 里 `classifyNonKey` 的注释。将来 xterm 新增任何一种
+ * 上报也照样被接住，不需要有人回来补名单。
+ *
+ * 放宽会不会把**真的用户输入**一起滤掉？本文件里不会：它注入的输入只有中文
+ * 上屏文本（`你好`）和退格（DEL，0x7f），都不以 ESC 开头。方向键、Esc 键那类
+ * ESC 开头的按键本文件一个都没用到——真要测那些键，得在这里另开一条不套滤镜的
+ * 通道，别直接放宽这条判据。
  */
-const AUTO_REPLY = /^\x1b\[[\d;]*[Rc]$/
+const AUTO_REPLY = /^\x1b/
 
 /**
  * 当前状态快照。
@@ -111,6 +144,31 @@ async function snapshot(): Promise<{
       cursorX: buf.cursorX,
     }
   }, AUTO_REPLY.source)
+}
+
+/**
+ * 轮询快照直到 `predicate` 满足；超时则返回**最后一份快照**（不抛异常）。
+ *
+ * 不抛异常是刻意的：调用点后面紧跟着一条正常的 `expect`，让它去报错能给出
+ * "屏幕上没有出现 X + 诊断日志"这种可读的失败信息，比在这里抛一个通用超时
+ * 有用得多。这个函数只负责"别过早往下走"。
+ */
+async function waitForSnapshot(
+  predicate: (s: Awaited<ReturnType<typeof snapshot>>) => boolean,
+  what: string,
+  timeoutMs = ECHO_TIMEOUT_MS,
+): Promise<Awaited<ReturnType<typeof snapshot>>> {
+  const deadline = Date.now() + timeoutMs
+  let last = await snapshot()
+  while (!predicate(last)) {
+    if (Date.now() > deadline) {
+      console.log(`  ⚠ 等待「${what}」超过 ${timeoutMs}ms 仍未满足，按当前状态继续断言`)
+      break
+    }
+    await new Promise((r) => setTimeout(r, 100))
+    last = await snapshot()
+  }
+  return last
 }
 
 /** 设置组词中间态（等价于用户还在拼、还没选词）。 */
@@ -158,9 +216,19 @@ test('上屏之后文字正确进入：一次 onData，内容就是那两个汉�
   // Input.insertText 就是输入法"确认上屏"这个动作在 CDP 上的等价物：
   // 它结束当前 composition 并把最终文本作为一个整体插入。
   await cdp.send('Input.insertText', { text: COMMITTED })
-  await new Promise((r) => setTimeout(r, SETTLE_MS))
 
-  const after = await snapshot()
+  // 等**屏幕上真的出现了那两个汉字**再取快照，而不是干等一个固定的 SETTLE_MS。
+  //
+  // 为什么：600ms 这个数隐含假设了"从端立刻回显"。Linux 上回显来自内核行规程，
+  // 确实是立刻；但 Windows 上是真 PowerShell + PSReadLine，冷启动时它可能还没
+  // 就绪，字节先在 PTY 里排队、就绪之后才一起回显。同一类假设刚刚让
+  // e2e/latency-pairing.e2e.ts 在 Windows CI 上红掉（敲了键但从端没有任何回显）。
+  // 改成"等到判据满足"之后，机器快就早点往下走、机器慢就多等一会儿，两边都不
+  // 用调参；等不到才失败，而且失败信息说得清是"屏幕上始终没出现"。
+  const after = await waitForSnapshot(
+    (s) => s.screen.includes(COMMITTED),
+    `屏幕上出现 "${COMMITTED}"`,
+  )
   const newlySent = after.sent.slice(before.sent.length)
 
   expect(
@@ -173,6 +241,8 @@ test('上屏之后文字正确进入：一次 onData，内容就是那两个汉�
 
   // 走完 PTY 往返之后，屏幕上要真的出现这两个汉字——只断言"发出去了"是不够的，
   // 多字节 UTF-8 在 IPC 任何一段被截断/重编码都会在这里露馅。
+  // （上面的 waitForSnapshot 已经等的就是这个条件；这条断言留着是为了在它超时
+  // 返回最后一份快照时，给出一句人能直接读懂的失败原因，而不是一个光秃秃的超时。）
   expect(
     after.screen,
     `屏幕上没有出现 "${COMMITTED}"。\n诊断日志：\n${await readDiagnosticLog(page)}`,
