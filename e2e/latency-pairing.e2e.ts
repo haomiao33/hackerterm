@@ -70,7 +70,12 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 let app: ElectronApplication
 let page: Page
-let readiness: { ok: boolean, attempts: number, elapsedMs: number }
+type Readiness = { ok: boolean, attempts: number, elapsedMs: number }
+let readiness: Readiness
+/** 取消输入行之后的复查（见 beforeAll 里那段「为什么从 Ctrl+C 换成 Esc」）。 */
+let readinessAfterCancel: Readiness
+/** 正式采样前一刻的复查。 */
+let readinessBeforeKey: Readiness
 let afterQuery: LatencyProbeSnapshot
 let afterFocus: LatencyProbeSnapshot
 let afterKey: LatencyProbeSnapshot
@@ -128,13 +133,40 @@ beforeAll(async () => {
   // PowerShell 可能要几十秒才就绪，此前的固定 500ms 静置在那种机器上必然踩空。
   readiness = await waitForEchoPath()
 
-  // 探测阶段往 shell 的命令行上敲了若干个 'x'。发一次 Ctrl+C 把这行取消掉，
+  // 探测阶段往 shell 的命令行上敲了若干个 'x'。按一次 Esc 把这行取消掉，
   // 让后面几个阶段面对的是一个干净的提示符（PSReadLine 行内容越长，重绘时
   // 发的查询越多，噪声越大）。
-  // **必须在 reset() 之前做**：Ctrl+C 送出的 0x03 自己也是一条非按键 onData，
-  // 而且它不以 ESC 开头，会把下面那条"所有非按键 onData 都是终端上报"的断言
-  // 弄成假红——那条断言的前提是这一阶段我们只发查询、不按别的键。
-  await page.keyboard.press('Control+C')
+  // **必须在 reset() 之前做**：Esc 送出的 0x1b 自己也是一条非按键 onData，
+  // 会把下面那条"所有非按键 onData 都是终端上报"的断言弄成假红——那条断言的
+  // 前提是这一阶段我们只发查询、不按别的键。
+  //
+  // ── 【为什么从 Ctrl+C 换成 Esc】────────────────────────────────────────
+  // 这条测试最近一次在 Windows CI 上红的是最后一条「真按键产生且只产生一个样本」，
+  // 而且失败现场很特别：`nonKeyKinds` 是**空的**——不是被自动回复干扰，是那次
+  // 按键之后**一个字节都没回来**。同一轮里前面几条（终端查询、焦点上报）全绿，
+  // 而它们量的是 xterm 自己的自动回复，**根本不需要从端参与**。也就是说：到了
+  // 最后一个阶段，从端已经不回话了。
+  // 最像的解释就是这一行：`Ctrl+C` 送进 PTY 的 0x03 会被 ConPTY 变成
+  // CTRL_C_EVENT 发给控制台进程组。PSReadLine 接管之后它是"取消当前输入行"，
+  // 但 PowerShell **还在启动**（加载 profile / PSReadLine 自身）时，走的是默认
+  // 处理——**直接终止进程**。上面的就绪门只保证"回显通路活过一次"，不保证
+  // PSReadLine 已经接管，Windows 冷启动下这中间有好几秒的窗口。
+  // Esc 在 PSReadLine 里是 RevertLine（清空当前输入行），在 bash 上无害，
+  // 而且**它只是一个普通字节，不产生任何控制台信号，不可能杀掉从端**。
+  // 清行这件事本来就只是为了少点噪声，没必要为它冒杀掉 shell 的风险。
+  //
+  // 【这条改动只能在 Windows CI 上验证】Linux 上 Electron 里根本没有 shell
+  // （PTY 子进程 exec 不起来），Ctrl+C 也好 Esc 也好，回显都来自内核行规程，
+  // 复现不出 PowerShell 被信号打死这件事。所以下面又补了两道就绪门：万一根因
+  // 不是这一行，那两道门会把"从端是在哪一步不回话的"直接指出来，而不是让人
+  // 对着一个空的 nonKeyKinds 再猜一轮。
+  await page.keyboard.press('Escape')
+  await sleep(QUIESCE_MS)
+
+  // ── 就绪门之二：取消行之后，回显通路必须**仍然**是活的 ──────────────────
+  // 上面那一行要是把从端弄死了（历史上 Ctrl+C 的嫌疑正在于此），这里立刻就能
+  // 抓住，而不是等到三个阶段之后由最后一条断言以"没有样本"的形式含糊地报出来。
+  readinessAfterCancel = await waitForEchoPath()
   await sleep(QUIESCE_MS)
   await page.evaluate(() => { window.__htLatency!.reset() })
 
@@ -171,12 +203,26 @@ beforeAll(async () => {
   await sleep(QUIESCE_MS)
   await page.evaluate(() => { window.__htLatency!.reset() })
 
+  // ── 就绪门之三：正式采样**前一刻**再确认一次通路还活着 ──────────────────
+  // 前面两道门和这里之间隔了两个阶段（终端查询 + 焦点上报），期间 xterm 的自动
+  // 回复会被真的写进 PTY，从端也在跑自己的事。"十几秒前活着"不等于"现在活着"，
+  // 而下面那条断言（一次按键恰好一个样本）默认的正是"现在活着"。
+  // 这道门不改变任何测量口径：它只是先按几次键确认从端还回话，然后 reset() 把
+  // 计数器清干净，正式那一轮仍然是独立的一轮。
+  readinessBeforeKey = await waitForEchoPath()
+  await sleep(QUIESCE_MS)
+  await page.evaluate(() => { window.__htLatency!.reset() })
+
   // ── 阶段三：真按一个键，这一次必须记到样本 ────────────────────────────
   await page.evaluate(() => { window.__htLatency!.arm() })
   await page.keyboard.press(KEY)
   await page.evaluate(() => window.__htLatency!.waitArmed())
   afterKey = await page.evaluate(() => window.__htLatency!.snapshot())
-}, MOUNT_TIMEOUT_MS + ECHO_READY_TIMEOUT_MS + 60_000)
+// 三道就绪门，每道最坏各等一个 ECHO_READY_TIMEOUT_MS——健康时每道只花一次探测
+// （毫秒级），这个和只是给"真的坏了"时留出把三道门各自跑完、好定位到底坏在哪一
+// 步的余量。少算这一项的话，超时会先于断言触发，报出来的是"钩子超时"这种最没有
+// 信息量的失败。
+}, MOUNT_TIMEOUT_MS + ECHO_READY_TIMEOUT_MS * 3 + 60_000)
 
 afterAll(async () => {
   await app?.close()
@@ -191,6 +237,32 @@ test('就绪门：开始采样之前，「按键 → 回显」这条通路必须
     `等了 ${readiness.elapsedMs}ms、探测了 ${readiness.attempts} 轮，`
     + `始终没有一次按键回显回来——从端（shell / 行规程）没有就绪。`
     + `诊断日志：\n${await readDiagnosticLog(page)}`,
+  ).toBe(true)
+})
+
+test('取消输入行之后，回显通路必须仍然是活的（从端没有被那一下按键弄死）', async () => {
+  // 这条是上一轮 Windows 故障的**定位器**：那次最后一条断言拿到的是"一个样本都
+  // 没有、也没有任何自动回复"，也就是从端在某个时刻起就不回话了，但看不出是哪
+  // 一步弄的。取消输入行是整段流程里唯一往从端送控制字符的地方，所以在它后面
+  // 单独立一道门——它红，就是这一下的锅（历史上是 Ctrl+C，现在换成了 Esc）。
+  expect(
+    readinessAfterCancel.ok,
+    `取消输入行之后等了 ${readinessAfterCancel.elapsedMs}ms、探测了 `
+    + `${readinessAfterCancel.attempts} 轮，再也没有一次按键回显回来——`
+    + '从端在这一步之后就不回话了。诊断日志：\n'
+    + await readDiagnosticLog(page),
+  ).toBe(true)
+})
+
+test('正式采样之前一刻，回显通路必须仍然是活的', async () => {
+  // 和上一条同理，只是位置在两个阶段之后、正式那一轮之前。它绿而最后一条红，
+  // 说明问题真的出在**配对**上（那才是本文件要管的事）；它红，说明问题出在
+  // 从端存活/就绪，跟配对逻辑无关——两种结论要的修法完全不一样，不能混为一谈。
+  expect(
+    readinessBeforeKey.ok,
+    `正式采样前等了 ${readinessBeforeKey.elapsedMs}ms、探测了 `
+    + `${readinessBeforeKey.attempts} 轮，回显都没有回来。诊断日志：\n`
+    + await readDiagnosticLog(page),
   ).toBe(true)
 })
 

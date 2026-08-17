@@ -9,6 +9,7 @@ import { mountTerminal } from './terminal/mount'
 import { log } from './diagnostics/log'
 import { installErrorHandlers } from './diagnostics/errors'
 import { createIncomingDataLogger } from './diagnostics/byte-throttle'
+import { createMultiSessionDiagnostics } from './diagnostics/multi-session'
 import { logStartupTiming } from './diagnostics/startup-timing'
 
 // preload 通过 contextBridge 暴露的两个入口：要控制通道、要某个会话的数据
@@ -238,7 +239,24 @@ function waitForDataPort(sessionId: string, client: ProtocolClient): void {
     // 诊断入口（不是产品 API，见 mount.ts 里 __htDiagnostics 的注释）：
     // 用户能开 DevTools，"此刻还剩几个读线程活着"是排查"数据怎么不来了"时
     // 最想随时问一遍的那个数，做成可手动调用的比只在几个时机打日志有用得多。
-    window.__htDiagnostics = { ...window.__htDiagnostics!, coreStats: () => logCoreStats(client) }
+    //
+    // `sessions` 是**多会话驱动面**，同样只为诊断/测试存在（见
+    // diagnostics/multi-session.ts 顶部那段边界说明）：产品 UI 现在只有一条
+    // 会话，而"10+ 并发会话互不串扰"这件事必须在真渲染进程里验，否则整个渲染
+    // 侧数据面（两跳 MessagePort + SessionDataBuffer + 合批 + 出向路由）就是
+    // 零覆盖。**没人调用它时它什么都不做**，不改变本文件上面任何一行的行为。
+    //
+    // 为什么挂在这里而不是拿到控制端口时就挂：`mountTerminal` 里那句
+    // `window.__htDiagnostics = { term }` 是整体赋值，早挂会被它覆盖掉。挂在
+    // 它后面（本行所在位置）是当前唯一不需要改动 mount.ts 的正确时机。
+    window.__htDiagnostics = {
+      ...window.__htDiagnostics!,
+      coreStats: () => logCoreStats(client),
+      sessions: createMultiSessionDiagnostics({
+        client,
+        openDataPort: (id) => window.ht.openDataPort(id),
+      }),
+    }
 
     dataPort.onmessage = (m) => {
       const bytes = new Uint8Array(m.data)

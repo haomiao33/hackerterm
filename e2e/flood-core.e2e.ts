@@ -28,15 +28,42 @@ import {
   FLOW_ACK_BATCH_BYTES, FLOW_HIGH_WATER_BYTES, FLOW_PAUSE_STALL_TIMEOUT_MS,
 } from './rust-limits'
 
+/** 刷屏内容的一行。两个平台共用，方便对着日志确认灌进来的确实是它。 */
+const FLOOD_LINE = 'hackerterm-flood-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+
 /**
  * 无限刷屏的命令。两个平台各自选一条**不依赖任何外部程序**的：
  * - 类 Unix：`yes` 是 coreutils，任何发行版都有。
- * - Windows：PowerShell 的 `while($true){...}`，不用 `yes`（Windows 上没有这个
- *   命令，这正是 CI 里 verify job 常年飘红的原因之一）。
+ * - Windows：PowerShell，不用 `yes`（Windows 上没有这个命令，这正是 CI 里
+ *   verify job 常年飘红的原因之一）。
+ *
+ * ── Windows 这条为什么从 `while($true){"…"}` 改掉（CI 实测红了）────────────
+ * 原来那条在 smoke-windows 上量出来是 **0.2 MiB/s**（3 秒只灌进 0.5 MiB），
+ * 而同一条测试在 Linux 上是 41 MiB/s——差 200 倍，直接把
+ * "3 秒至少 8 MiB" 这条判据顶红了。
+ *
+ * **不能为了变绿去降 MIN_FLOOD_BYTES**：那个阈值的意义是"这一轮真的把流控压到了
+ * 稳态"，压不到就该说这轮不作数（原测试正是这么写的，那个设计是对的）。要改的是
+ * "怎么在 PowerShell 里真的把数据灌起来"。
+ *
+ * 慢在哪：`"字符串"` 是往**对象管道**里扔一个对象，PowerShell 要经过格式化子系统
+ * （Out-Default → 格式化器 → 主机 WriteLine）才落到控制台，每行一次，开销全在这
+ * 一路上，跟我们要压的那条数据通道毫无关系。
+ * 改法是绕开管道：先在内存里拼好一大块（约 55 KiB），然后 `[Console]::Out.Write`
+ * 直接写标准输出——一次调用一大块，格式化器完全不参与。`[Console]::Out` 在 .NET
+ * 上默认 AutoFlush，写完立刻进 ConPTY，不会攒在缓冲区里骗过我们的计量。
+ *
+ * 为什么还是 `while($true)` 而不是有限循环：这条测试的第二半是"中断后 1 秒内停
+ * 下来"，需要一个**真的停不下来的东西**去中断。PowerShell 引擎在循环体的每条语句
+ * 之间检查停止请求，所以 Ctrl+C 照样能打断它。
+ *
+ * 【这条改动只能在 Windows CI 上验证】容器里没有任何 PowerShell（`pwsh` 和
+ * `powershell` 都不存在），本地跑不出它的吞吐。下面失败信息里带上了命令原文，
+ * 万一还是不够快，下一轮日志里能直接看到跑的是哪一条。
  */
 const FLOOD_COMMAND = process.platform === 'win32'
-  ? 'while($true){"hackerterm-flood-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"}\r'
-  : 'yes hackerterm-flood-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\r'
+  ? `$c=(('${FLOOD_LINE}'+[char]13+[char]10)*1024);while($true){[Console]::Out.Write($c)}\r`
+  : `yes ${FLOOD_LINE}\r`
 
 /** 刷屏持续时长。够长到稳态、又不至于让 CI 白等。 */
 const FLOOD_MS = 3_000
@@ -143,7 +170,11 @@ test('刷屏不假死：真 shell 全速灌数据，背压全程没有降级', a
   const mibPerSec = floodBytes / 1024 / 1024 / (elapsed / 1000)
   const detail =
     `实测灌入 ${(floodBytes / 1024 / 1024).toFixed(1)} MiB / ${elapsed}ms ` +
-    `= ${mibPerSec.toFixed(1)} MiB/s`
+    `= ${mibPerSec.toFixed(1)} MiB/s` +
+    // 把刷屏命令原文一并带上：这条判据红过一次，而当时唯一缺的信息就是
+    // "从端到底在跑什么"。有了它，"是命令太慢"还是"是我们这条链路太慢"
+    // 下一轮不用再猜（Windows 上这两者的量级差了两个数量级）。
+    `；刷屏命令：${JSON.stringify(FLOOD_COMMAND)}`
 
   expect(floodBytes, `${detail}——数据量太小，shell 根本没在刷屏，这一轮压测不作数`)
     .toBeGreaterThan(MIN_FLOOD_BYTES)
@@ -164,8 +195,11 @@ test(`刷屏中断：发出中断后 ${INTERRUPT_DEADLINE_MS}ms 内必须停下�
   await new Promise((r) => setTimeout(r, FLOOD_MS))
 
   const bytesAtInterrupt = m.bytes()
-  expect(bytesAtInterrupt, '中断之前根本没在刷屏，这条测试没有意义')
-    .toBeGreaterThan(MIN_FLOOD_BYTES)
+  expect(
+    bytesAtInterrupt,
+    `中断之前根本没在刷屏（${FLOOD_MS}ms 只收到 ${bytesAtInterrupt} 字节），这条测试没有意义。`
+    + `刷屏命令：${JSON.stringify(FLOOD_COMMAND)}`,
+  ).toBeGreaterThan(MIN_FLOOD_BYTES)
 
   const t0 = Date.now()
   await m.session.signalInt()
