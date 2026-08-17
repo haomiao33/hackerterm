@@ -60,13 +60,25 @@ const FLOOD_LINE = 'hackerterm-flood-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
  * 【这条改动只能在 Windows CI 上验证】容器里没有任何 PowerShell（`pwsh` 和
  * `powershell` 都不存在），本地跑不出它的吞吐。下面失败信息里带上了命令原文，
  * 万一还是不够快，下一轮日志里能直接看到跑的是哪一条。
+ *
+ * ── 【记一个产品事实】Windows 上的刷屏吞吐天花板 ─────────────────────────
+ * 同一套压测、同一份代码，实测：
+ *     Linux（PTY + `yes`）              约 41 MiB/s
+ *     Windows（ConPTY + PowerShell）    约 2.3 MiB/s
+ * **差约 18 倍**，而且这 2.3 已经是把 PowerShell 那侧优化过一轮之后的数字
+ * （从 0.2 MiB/s 提到 2.3 MiB/s，见上一段）。剩下的差距在 **ConPTY 本身**：
+ * 它要把子进程的输出先渲染进一个屏幕缓冲区、再序列化成 VT 序列吐出来，这一段
+ * 不在我们手里。我们自己那段链路是干净的——IPC 单跳实测 0.36ms（见
+ * e2e/latency-*.ts），根本不是瓶颈。
+ *
+ * 为什么值得写在这里：用户核心要求第②条有「cat 大文件、tail 日志要丝滑」。
+ * 将来在 Windows 上看到"刷屏怎么这么慢"，**先想到这个天花板**，别一头扎进
+ * IPC / 流控里找问题——那边已经量过了。真要提这个数，方向是绕开 ConPTY 的
+ * 渲染（例如换传输层或直接管道），不是调我们的水位。
  */
 const FLOOD_COMMAND = process.platform === 'win32'
   ? `$c=(('${FLOOD_LINE}'+[char]13+[char]10)*1024);while($true){[Console]::Out.Write($c)}\r`
   : `yes ${FLOOD_LINE}\r`
-
-/** 刷屏持续时长。够长到稳态、又不至于让 CI 白等。 */
-const FLOOD_MS = 3_000
 
 /**
  * 「停下来了」的判据：连续这么久一个字节都没再来。
@@ -83,8 +95,38 @@ const QUIET_MS = 300
  */
 const INTERRUPT_DEADLINE_MS = 1_000
 
-/** 一次压测至少要灌进来多少字节才算数。低于这个量说明 shell 压根没在刷屏。 */
+/**
+ * 一次压测至少要灌进来多少字节才算数。低于这个量说明 shell 压根没在刷屏。
+ *
+ * 8 MiB 是**有含义的数字**，不许为了让 CI 变绿去降：高水位是 1 MiB，8 MiB
+ * 意味着"灌满 → 被按住 → ack 放行"这个循环被真正压满了 8 轮，流控是在稳态下
+ * 被检验的，而不是刚碰到水位就收工。
+ */
 const MIN_FLOOD_BYTES = 8 * 1024 * 1024
+
+/**
+ * 灌数据的**上限时长**——注意它是"最多灌这么久"，不是"就灌这么久"。
+ *
+ * ── 为什么把时间和数据量拆开 ────────────────────────────────────────
+ * 原来写的是「固定灌 3 秒，然后要求收到 ≥ 8 MiB」。那等于在要求
+ * **≥ 2.8 MiB/s 的吞吐**——可 Windows 上 ConPTY 实测就在 2.3 MiB/s 上下
+ * （见 FLOOD_COMMAND 上面那段），CI 机器还是跟别人共享的。于是这条判据必然
+ * 随机红，而且红的时候报的是"数据量太小，shell 根本没在刷屏"——一句**与事实
+ * 不符**的诊断：shell 明明在拼命刷，只是这台机器没那么快。
+ * 一个会随机红的门禁比没有门禁更糟：它会训练所有人无视红灯。
+ *
+ * 病根是「3 秒」这个数同时扛了两件不该混在一起的事：
+ *   ① 喂够量——由 MIN_FLOOD_BYTES 负责，它有物理含义（8 轮水位循环）；
+ *   ② 别跑太久——这才是超时该管的事，它只需要"宽松到不误伤"。
+ * 拆开之后：**灌到够为止**，够了立刻停（快的机器上反而比原来更快结束），
+ * 到上限还不够才判失败——那时候"没在刷屏"才是真结论。
+ *
+ * 30 秒怎么来的：按 Windows 实测下限 2.3 MiB/s，灌够 8 MiB 需要约 3.5 秒；
+ * 30 秒留了约 8.5 倍余量，也就是说这台机器得比已知最慢的情况**再慢 8 倍**才会
+ * 误报。同时它远小于单条测试 120 秒的超时，超时了也能出我们自己的断言信息
+ * （带实测吞吐），而不是被 vitest 掐掉、只留一句没有信息量的 timeout。
+ */
+const FLOOD_TIMEOUT_MS = 30_000
 
 let core: CoreConnection
 /** 收到的 `session.flow_stalled` 事件，全局收集（它属于哪条会话由 payload 带）。 */
@@ -153,19 +195,44 @@ async function openMeteredSession(): Promise<Meter> {
   }
 }
 
-test('刷屏不假死：真 shell 全速灌数据，背压全程没有降级', async () => {
-  const m = await openMeteredSession()
-  const before = m.bytes()
-  const stallsBefore = stallEvents.length
+/** 一轮刷屏的实测结果。 */
+interface FloodResult {
+  /** 这一轮收到的字节数。 */
+  floodBytes: number
+  /** 从写下命令到停手经过的毫秒数（含 shell 回显命令、开始刷屏之前那一小段）。 */
+  elapsed: number
+  /** 人能看懂的一行：灌了多少、多久、多快、跑的哪条命令。断言信息和日志共用。 */
+  detail: string
+}
 
+/**
+ * 灌到**累计够 MIN_FLOOD_BYTES 为止**，或到 FLOOD_TIMEOUT_MS 上限为止。
+ *
+ * 够了就立刻返回——不多灌一个字节，也不按秒表空等。为什么这么设计见
+ * FLOOD_TIMEOUT_MS 上面那段：喂够量和别跑太久是两件事，不该由同一个数字扛。
+ *
+ * 无论成没成都**打印实测吞吐**：这条链路在 Linux 和 Windows 上差着一个数量级
+ * （41 vs 2.3 MiB/s），把每次的实测值留在 CI 日志里，下次谁怀疑"是不是变慢了"
+ * 有历史可比，不必再临时加日志重跑一遍。
+ *
+ * 【读这个数的时候注意】elapsed 从"写下命令"起算，含 shell 回显命令、把
+ * `while` 循环转起来那一小段固定开销。Linux 上灌够 8 MiB 只要 300ms 左右，
+ * 那点固定开销占比不小，于是打出来是 21~27 MiB/s，比稳态的 41 MiB/s 低——
+ * **这是量法造成的，不是性能退化**。要横向比，比同一平台的历史值。
+ */
+async function floodUntilEnough(m: Meter): Promise<FloodResult> {
+  const before = m.bytes()
   const t0 = Date.now()
   m.session.write(new TextEncoder().encode(FLOOD_COMMAND))
-  await new Promise((r) => setTimeout(r, FLOOD_MS))
-  const floodBytes = m.bytes() - before
-  const elapsed = Date.now() - t0
 
-  await m.session.signalInt()
-  await new Promise((r) => setTimeout(r, 500))
+  let floodBytes = 0
+  let elapsed = 0
+  for (;;) {
+    floodBytes = m.bytes() - before
+    elapsed = Date.now() - t0
+    if (floodBytes >= MIN_FLOOD_BYTES || elapsed >= FLOOD_TIMEOUT_MS) break
+    await new Promise((r) => setTimeout(r, 20))
+  }
 
   const mibPerSec = floodBytes / 1024 / 1024 / (elapsed / 1000)
   const detail =
@@ -175,9 +242,27 @@ test('刷屏不假死：真 shell 全速灌数据，背压全程没有降级', a
     // "从端到底在跑什么"。有了它，"是命令太慢"还是"是我们这条链路太慢"
     // 下一轮不用再猜（Windows 上这两者的量级差了两个数量级）。
     `；刷屏命令：${JSON.stringify(FLOOD_COMMAND)}`
+  console.log(`  刷屏吞吐（${process.platform}）：${detail}`)
 
-  expect(floodBytes, `${detail}——数据量太小，shell 根本没在刷屏，这一轮压测不作数`)
-    .toBeGreaterThan(MIN_FLOOD_BYTES)
+  return { floodBytes, elapsed, detail }
+}
+
+test('刷屏不假死：真 shell 全速灌数据，背压全程没有降级', async () => {
+  const m = await openMeteredSession()
+  const stallsBefore = stallEvents.length
+
+  const { floodBytes, elapsed, detail } = await floodUntilEnough(m)
+
+  await m.session.signalInt()
+  await new Promise((r) => setTimeout(r, 500))
+
+  // 只有"到了上限还没灌够"才判不作数——而不是"3 秒内没灌够"。慢机器只是慢，
+  // 不等于 shell 没在刷屏；把这两者混为一谈正是这条判据以前随机红的原因。
+  expect(
+    floodBytes,
+    `${detail}——灌到 ${elapsed}ms 上限（${FLOOD_TIMEOUT_MS}ms）仍不够 ` +
+    `${MIN_FLOOD_BYTES / 1024 / 1024} MiB，shell 根本没在刷屏，这一轮压测不作数`,
+  ).toBeGreaterThanOrEqual(MIN_FLOOD_BYTES)
 
   // 核心判据：全程一次 flow_stalled 都不该有。
   // 这个事件的含义是"核心等了整整一个看门狗周期都没等到 ack，只好放弃背压"——
@@ -191,15 +276,20 @@ test('刷屏不假死：真 shell 全速灌数据，背压全程没有降级', a
 
 test(`刷屏中断：发出中断后 ${INTERRUPT_DEADLINE_MS}ms 内必须停下来`, async () => {
   const m = await openMeteredSession()
-  m.session.write(new TextEncoder().encode(FLOOD_COMMAND))
-  await new Promise((r) => setTimeout(r, FLOOD_MS))
+
+  // 前置条件跟上一条测试一样：先真的把刷屏压到稳态，再谈"中断得快不快"。
+  // 上一轮 CI 里这条测试红，红的也是这个前置条件（固定 3 秒喂不够 8 MiB），
+  // 跟中断本身无关——所以这里一并改成"灌够为止"。
+  // 【注意 1000ms 这条线一个毫秒都没放宽】它来自产品第②条，不是调出来的，
+  // Linux 上实测 2ms 就停了，余量大得很，没有任何放宽的理由。
+  const { floodBytes, elapsed, detail } = await floodUntilEnough(m)
 
   const bytesAtInterrupt = m.bytes()
   expect(
-    bytesAtInterrupt,
-    `中断之前根本没在刷屏（${FLOOD_MS}ms 只收到 ${bytesAtInterrupt} 字节），这条测试没有意义。`
-    + `刷屏命令：${JSON.stringify(FLOOD_COMMAND)}`,
-  ).toBeGreaterThan(MIN_FLOOD_BYTES)
+    floodBytes,
+    `中断之前没能把刷屏压起来（${detail}，灌了 ${elapsed}ms 到上限 ` +
+    `${FLOOD_TIMEOUT_MS}ms），这条测试没有意义`,
+  ).toBeGreaterThanOrEqual(MIN_FLOOD_BYTES)
 
   const t0 = Date.now()
   await m.session.signalInt()
