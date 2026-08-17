@@ -50,6 +50,29 @@ describe('SessionDataBuffer', () => {
     expect(receivedA).toHaveLength(1)
   })
 
+  it('routes to the target session only, even when every session already has a live sink', () => {
+    // 上面那条 "keeps separate sessions from cross-talking" 有一个**盲区**：它的两次
+    // push 都发生在 attach **之前**，push 那一刻一个 sink 都还没挂上，于是"push 到底
+    // 是按 sessionId 路由、还是发给所有人"这件事根本没被执行到。
+    //
+    // 实测证据（本轮变异验证）：把 push 改成"发给所有已挂载的 sink"（广播），
+    // 本文件其余用例连同 e2e/concurrency-core.e2e.ts **全绿通过**。
+    // 而真实运行时的形态恰恰相反——十几条会话的数据端口早就都接好了，数据才一块块
+    // 地来。这条用例补的就是那个形态。
+    const buffer = new SessionDataBuffer()
+    const received: Record<string, number[][]> = { a: [], b: [], c: [] }
+    for (const id of ['a', 'b', 'c']) {
+      buffer.attach(id, (data: Uint8Array) => received[id].push(Array.from(data)))
+    }
+
+    buffer.push('b', new Uint8Array([7, 7]))
+
+    expect(received.b).toEqual([[7, 7]])
+    // 这两条才是本用例的全部意义：广播的话它们会各多出一条。
+    expect(received.a).toEqual([])
+    expect(received.c).toEqual([])
+  })
+
   it('does not throw and does not deliver to a detached sink when pushed after detach', () => {
     const buffer = new SessionDataBuffer()
     const sink = vi.fn()

@@ -9,6 +9,8 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { FitAddon } from '@xterm/addon-fit'
 import { log } from '../diagnostics/log'
 import { createOnDataLogger } from '../diagnostics/byte-throttle'
+// 只用于下面 __htDiagnostics 的类型声明（import type 不产生任何运行时代码）。
+import type { MultiSessionDiagnostics } from '../diagnostics/multi-session'
 
 export interface TerminalHandle {
   write(bytes: Uint8Array): void
@@ -39,6 +41,14 @@ declare global {
        * 不来了"时在 DevTools 里手动调，比只在固定几个时机打日志有用得多。
        */
       coreStats?: () => Promise<number>
+      /**
+       * 多会话驱动面：由 boot.ts 在数据端口就绪后补挂（这里只声明类型）。
+       * 供「10+ 并发会话双向串扰」端到端测试在**同一个渲染进程里**开多条会话
+       * ——产品 UI 目前只有一条会话，没有它这条链路就只能靠 Node 直连 napi 去
+       * 测，而那样整个渲染侧数据面根本不会被执行。边界见
+       * diagnostics/multi-session.ts 顶部注释：不被调用时不做任何事。
+       */
+      sessions?: MultiSessionDiagnostics
     }
   }
 }

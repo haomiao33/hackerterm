@@ -109,6 +109,22 @@ jobs:
   # 2. Linux runner 比 Windows runner 快且便宜，冒烟测试要跑得勤。
   # 它的**盲区**由下面新增的 smoke-windows 补上（ConPTY 专有路径 + 在 Linux 上
   # 只能跳过的那条"命令输出"断言）。两个平台各跑一份，不是重复劳动。
+  #
+  # ── 【这个 job 里跑的东西】────────────────────────────────────────────
+  # `pnpm test:e2e` = e2e/**/*.e2e.ts 全部（见 e2e/vitest.config.ts 的 include），
+  # 新增文件自动进来，这里不需要、也不应该逐个登记或过滤。
+  # 特别点名一条本轮新增的，因为它在 Linux 上**恰恰是判据最干净的那个平台**：
+  # e2e/concurrency-crosstalk.e2e.ts —— 真 Electron 里同时开 13 条会话
+  # （12 条 + 主终端），验证**发送**和**返回**两个方向都不串。Linux 上 PTY 子进程
+  # exec 不起来、没有 shell，每条会话**只会回显自己被写进去的字节**，一个字节的
+  # 噪声都没有；"这个标记怎么会出现在这条流里"因此没有第二种解释。Windows 上是
+  # 真 PowerShell，同样的判据要在满是提示符/语法高亮/自动上报的噪声里成立——
+  # 两边合起来才算数。
+  # 【注意它慢】这个文件在本机要跑约 2 分钟，其中 100 秒花在"开 12 条会话"上：
+  # Linux 的 Electron 里每条 session.open 要 ~8.3 秒（子进程崩在 Chromium 的 fd
+  # 归属检查上，而 Rust 的 Command::spawn 要等子进程 exec 或死掉才返回），而同一段
+  # 代码在普通 Node 进程里 12 条一共只要 76ms。这不是测试的开销，是**它发现的一个
+  # 真问题**，细节写在那个文件的 OPEN_DEADLINE_MS 注释里。
   # ────────────────────────────────────────────────────────────────
   smoke:
     name: smoke e2e (linux, 键盘 → PTY → 屏幕)
@@ -220,6 +236,18 @@ jobs:
   #    每个都带 PSReadLine 的重绘和语法高亮，输出块的大小与节奏跟 bash 完全不是
   #    一回事。串扰、读线程计数、内存这三件事的**路由逻辑**平台无关，但把它们
   #    压到真实并发下的**负载形态**是平台相关的，所以两个平台都要跑。
+  # 4. **全流程双向串扰**（e2e/concurrency-crosstalk.e2e.ts，本轮新增）：同一个
+  #    渲染进程里同时开 13 条会话（12 条诊断会话 + 主终端），验证
+  #    「写给 A 的字节只进 A 的 PTY」和「A 的输出只回到 A 的消费者」两个方向。
+  #    上面第 3 条走的是普通 Node 直连 napi，**整个渲染侧数据面没被执行**；这一条
+  #    补的正是那一段（两跳 MessagePort + SessionDataBuffer + 合批 + 出向路由）。
+  #    为什么它在**这个 job** 里格外有价值：判据依赖"写进去的东西会回显回来"，
+  #    Windows 上这件事是**真 PowerShell + PSReadLine** 做的，回显里混着提示符、
+  #    语法高亮的转义序列、CPR/焦点上报等一堆主动输出——而 Linux 上只有内核行规程
+  #    干干净净地回显。同一套判据要在这两种噪声水平下都成立，才算真的立住了。
+  #    时间预算：Linux 上约 2 分钟（大头是 12 次 session.open，见 smoke job 的注释）。
+  #    Windows 走 ConPTY、没有那个崩溃的子进程，**预期会快得多**——两边的
+  #    「并发开 12 条会话 …ms」日志正好互为对照。
   #
   # 【硬门禁，不加 continue-on-error】理由：
   # 这条链路正是连着两天没跑通 demo 的那条，而 Windows 是用户实际会跑的平台。
@@ -544,6 +572,89 @@ jobs:
       run:
         shell: powershell
     steps:
+      # ── 【必须是第一步，在 checkout 之前】把 PATH 修正到"我们要的那个 bash / git" ──
+      #
+      # 真机上这个 job 死在 `dtolnay/rust-toolchain` 那一步，日志是：
+      #     shell: C:\Windows\system32\bash.EXE --noprofile --norc -e -o pipefail {0}
+      #     wsl: Failed to translate 'D:\phpstudy_pro\...'
+      #     <3>WSL (…) ERROR: execvpe(/bin/bash) failed: No such file or directory
+      # 也就是说 `bash` 命中的是 **WSL 的 bash**（C:\Windows\System32\bash.exe，
+      # 一个没装任何发行版的转发器），不是 Git for Windows 的 bash。托管 runner 上
+      # `C:\Windows\System32` 排在 Git 后面，所以这个坑从来没暴露过；用户机器上
+      # 顺序反过来了。
+      #
+      # 为什么必须用改 PATH 的办法解决，而不是"这一步别用 bash"：
+      # 触发它的是**第三方 action 内部**的 `shell: bash`（dtolnay/rust-toolchain 的
+      # action.yml 就是这么写的），我们改不了别人的 action。能改的只有它看到的 PATH。
+      # $GITHUB_PATH 写进去的目录会被**前置**到后续所有步骤（包括 JS action）的
+      # PATH 前面，正好覆盖这个场景。
+      #
+      # 顺带解决同一份日志里的第二个问题（同一个病因）：
+      #     [command]C:\Users\…\Atlassian\SourceTree\git_local\bin\git.exe reset --hard HEAD
+      # checkout 用的是 SourceTree 自带的那个 git。把选中的 Git 安装的 cmd 目录一并
+      # 前置，`git` 也就跟着钉死了。
+      #
+      # 判据是**跑一次 bash 看它答不答应**，而不是"文件存在就算数"：WSL 那个
+      # bash.exe 文件同样存在，只有真的执行一次才分得出来。查不到就把事实明明白白
+      # 打出来（哪些候选、各自为什么被否），绝不静默继续——静默继续的结果就是下一步
+      # 又炸在同一个地方，而日志里看不出为什么。
+      - name: 修正 PATH（bash → Git for Windows，不要 WSL；git → 同一份安装）
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host '--- 修正之前 ---'
+          Write-Host ('bash: ' + ((where.exe bash 2>$null) -join ' | '))
+          Write-Host ('git : ' + ((where.exe git  2>$null) -join ' | '))
+
+          # 候选 Git 安装根目录：先看 PATH 上现有的 git（含 SourceTree 自带的那份，
+          # 它本身就是一份 Git for Windows），再补上几个常见安装位置。
+          $roots = New-Object System.Collections.Generic.List[string]
+          foreach ($g in @(Get-Command git.exe -All -ErrorAction SilentlyContinue)) {
+            # …\Git\cmd\git.exe 或 …\Git\bin\git.exe → 取上上层
+            $root = Split-Path (Split-Path $g.Source -Parent) -Parent
+            if ($root) { $roots.Add($root) }
+          }
+          foreach ($p in @(
+            "$env:ProgramFiles\Git",
+            "${env:ProgramFiles(x86)}\Git",
+            "$env:LOCALAPPDATA\Programs\Git",
+            "$env:LOCALAPPDATA\Atlassian\SourceTree\git_local"
+          )) { if ($p -and (Test-Path $p)) { $roots.Add($p) } }
+
+          $chosen = $null
+          foreach ($root in ($roots | Select-Object -Unique)) {
+            $bash = Join-Path $root 'bin\bash.exe'
+            if (-not (Test-Path $bash)) { Write-Host ("否决 $root：没有 bin\bash.exe"); continue }
+            # 真跑一次。WSL 的转发器在这里会失败或输出别的东西。
+            $probe = (& $bash -c 'echo ht-bash-ok' 2>&1 | Out-String).Trim()
+            if ($probe -like '*ht-bash-ok*') { $chosen = $root; break }
+            Write-Host ("否决 $root：bash 跑不通（输出：$probe）")
+          }
+
+          if ($chosen) {
+            # 写 $GITHUB_PATH 用 .NET 的无 BOM UTF-8：5.1 的 Add-Content 默认写系统
+            # ANSI 代码页（中文 Windows 上是 GBK），路径里有非 ASCII 就会被写坏，
+            # 而且不报错——本文件下面几处踩过同一个坑。
+            $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+            $lines = @((Join-Path $chosen 'cmd'), (Join-Path $chosen 'bin'))
+            [System.IO.File]::AppendAllLines($env:GITHUB_PATH, [string[]]$lines, $utf8NoBom)
+            Write-Host ('选中 Git 安装：' + $chosen)
+            Write-Host ('已前置到 PATH：' + ($lines -join ' ; '))
+          } else {
+            Write-Host '::warning::没有找到任何能跑通的 Git for Windows bash。'
+            Write-Host '后面 dtolnay/rust-toolchain 这类内部写死 `shell: bash` 的 action'
+            Write-Host '会命中 WSL 的 C:\Windows\System32\bash.exe 并失败。'
+            Write-Host '解决办法：在这台机器上装 Git for Windows（或让已装的那份出现在上面的候选里）。'
+          }
+
+          # 【必须显式 exit 0】GitHub 的 powershell 包装器会在脚本末尾追加
+          # `exit $LASTEXITCODE`，而上面跑过 where.exe / bash.exe 这些**原生命令**
+          # ——只要最后一个原生命令是非零退出（例如 `where.exe bash` 什么都没找到，
+          # 它返回 1），这一步就会以失败告终。而 job 级的 continue-on-error 只保证
+          # 工作流不被判红，**不会**让后续步骤继续执行：这一步一红，整个诊断就没了。
+          # 这一步的职责是"尽力修 PATH 并如实汇报"，它本身不该有失败这个结局。
+          exit 0
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -576,6 +687,18 @@ jobs:
           # 内容缩进都比 `run:` 深——两个规则直接打架，写成 here-string 会让整个
           # workflow 文件 YAML 解析失败（已实测踩到）。改成字符串数组 join，
           # 缩进随便加，两边都满意。
+          #
+          # 【为什么不再写 -UsingNamespace】真机上这段报了：
+          #     Add-Type : …(3) : 视为错误的警告:
+          #     "System.Runtime.InteropServices"的 using 指令以前在此命名空间中出现过
+          # `Add-Type -MemberDefinition` 生成的桩代码**自带** `using
+          # System.Runtime.InteropServices;`，我们又用 -UsingNamespace 加了一遍 →
+          # 重复 using 触发 CS 警告，而 Windows PowerShell 5.1 的 Add-Type 把警告当
+          # 错误（托管 runner 上是 pwsh 7，编译器版本不同所以一直没报）。
+          # 修法不是"删掉重复的那一个"就完事——那样下次谁再加一个 -UsingNamespace
+          # 又会重来。这里**整个不用 -UsingNamespace**，签名里的类型一律写全名
+          # （System.Text.StringBuilder），从形状上就不可能再撞。
+          # DllImport / CharSet 保持短名：它们来自自带的那条 using，本来就没问题。
           try {
             $sig = @(
               '[DllImport("user32.dll")]',
@@ -585,9 +708,9 @@ jobs:
               '[DllImport("kernel32.dll")]',
               'public static extern uint GetCurrentThreadId();',
               '[DllImport("user32.dll", CharSet = CharSet.Unicode)]',
-              'public static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);'
+              'public static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, System.Text.StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);'
             ) -join [Environment]::NewLine
-            Add-Type -Namespace HT -Name U -MemberDefinition $sig -UsingNamespace System.Runtime.InteropServices, System.Text
+            Add-Type -Namespace HT -Name U -MemberDefinition $sig
             $sb = New-Object System.Text.StringBuilder 256
             $n = 0
             # nIndex = 2 (UOI_NAME)
@@ -609,16 +732,39 @@ jobs:
           } catch { Add-Fact 'desktop_monitors' "查询失败: $($_.Exception.Message)" }
 
           # Defender：冷启动那 81 秒的头号嫌疑人，必须记录它此刻的状态和排除项。
+          #
+          # 【真机上这两段是坏的，坏法很典型】日志里出现：
+          #     Get-MpPreference : Operation failed with the following error: 0x800106ba
+          # 用户为了排查启动慢**把 Defender 关了**，服务没跑，这两个 cmdlet 直接报错。
+          # 而原来的写法有两个毛病：
+          #  1. `try/catch` **接不住**它——PowerShell 的 cmdlet 报的是**非终止错误**，
+          #     只有 `-ErrorAction Stop` 才会变成终止错误进 catch。原来加了 catch 却
+          #     没加 -ErrorAction，等于 catch 是个摆设，错误照样打进日志、代码继续往下走。
+          #  2. 继续往下走的后果更糟：`$pref` 是 $null，`$pref.ExclusionPath` 也是
+          #     $null，于是表格里落下一行 `defender_exclusions = (无)`——一个**编出来
+          #     的假状态**。"没有排除项"和"压根查不到"是两回事，前者会让下一轮排查
+          #     直接走错方向。本项目的老规矩：宁可写"未获取到"，不许编数字。
+          # 修法：-ErrorAction Stop 让 catch 真的生效，catch 里如实写"未获取到 + 原因"。
+          # 另外补一条 WinDefend 服务状态：它能一句话回答"是关了还是没权限查"。
           try {
-            $mp = Get-MpComputerStatus
+            $svc = Get-Service -Name WinDefend -ErrorAction Stop
+            Add-Fact 'defender_service' $svc.Status
+          } catch { Add-Fact 'defender_service' "未获取到：$($_.Exception.Message)" }
+          try {
+            $mp = Get-MpComputerStatus -ErrorAction Stop
             Add-Fact 'defender_realtime' $mp.RealTimeProtectionEnabled
             Add-Fact 'defender_engine' $mp.AMEngineVersion
-          } catch { Add-Fact 'defender_realtime' "查询失败（NETWORK SERVICE 多半没权限）: $($_.Exception.Message)" }
+          } catch {
+            Add-Fact 'defender_realtime' "未获取到（Defender 未运行，或 NETWORK SERVICE 没权限）：$($_.Exception.Message)"
+            Add-Fact 'defender_engine' '未获取到'
+          }
           try {
-            $pref = Get-MpPreference
+            $pref = Get-MpPreference -ErrorAction Stop
             $ex = ($pref.ExclusionPath -join '; ')
-            Add-Fact 'defender_exclusions' $(if ($ex) { $ex } else { '(无)' })
-          } catch { Add-Fact 'defender_exclusions' "查询失败: $($_.Exception.Message)" }
+            # 这里的 '(无)' 是**真的查到了、结果确实是空**，跟下面 catch 里的
+            # "未获取到"必须泾渭分明。
+            Add-Fact 'defender_exclusions' $(if ($ex) { $ex } else { '(无，已确认查询成功)' })
+          } catch { Add-Fact 'defender_exclusions' "未获取到：$($_.Exception.Message)" }
 
           Add-Fact 'workspace' $env:GITHUB_WORKSPACE
           # 顺带把"这台机器上有没有 pwsh"这件事也记下来——本 job 上一次真机运行就是
