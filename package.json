@@ -21,7 +21,8 @@
     "test:e2e:update-screenshots": "node scripts/update-screenshots.mjs",
     "measure:latency": "node scripts/run-measure.mjs e2e/latency.ts",
     "measure:startup": "node scripts/run-measure.mjs e2e/startup-timeline.ts",
-    "measure:shell-cost": "node scripts/run-measure.mjs e2e/shell-cost.ts"
+    "measure:shell-cost": "node scripts/run-measure.mjs e2e/shell-cost.ts",
+    "measure:flow-wakeup": "node scripts/run-measure.mjs e2e/flow-wakeup-cost.ts"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.13.0",

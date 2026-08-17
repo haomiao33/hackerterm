@@ -20,6 +20,7 @@
  *    所以"连上核心"和"开一条会话"必须是两件事。
  */
 import {
+  CoreStatsRequest, CoreStatsResponse,
   Envelope, Hello, SessionAckRequest, SessionCloseRequest, SessionOpenRequest, SessionOpenResponse,
   SessionSignalRequest, Signal,
 } from '../src/ui/common/protocol/hackerterm'
@@ -74,6 +75,16 @@ export interface CoreConnection {
    * 看见这个事件，而不能只看收了多少字节。
    */
   onEvent(topic: string, cb: (payload: Uint8Array) => void): void
+  /**
+   * 向核心要一次诊断快照（控制面的 `core.stats` 方法）。
+   *
+   * 目前只有一个字段：**存活的 PTY 读线程数**。并发测试拿它当"会话数和线程数
+   * 对不对得上"的直接判据——每条会话恰好一个读线程，会话全关掉之后必须归零。
+   * 这比"数据还来不来"强得多：读线程静默退出（`Ok(0) | Err(_)` 那两个分支曾经
+   * 是直接 break、连日志都没有）时，症状只是"某条会话不再有输出"，从外面看跟
+   * "shell 正好没输出"分辨不出来，而这个数字会直接掉下去。
+   */
+  stats(): Promise<{ liveReadThreads: number }>
 }
 
 type CoreModule = typeof import('ht-node')
@@ -165,6 +176,11 @@ export async function connectCore(): Promise<CoreConnection> {
       const list = eventListeners.get(topic)
       if (list) list.push(cb)
       else eventListeners.set(topic, [cb])
+    },
+    async stats() {
+      const payload = await request('core.stats', CoreStatsRequest.encode({}).finish())
+      const { liveReadThreads } = CoreStatsResponse.decode(payload)
+      return { liveReadThreads }
     },
     async openSession({ cols = 80, rows = 24, shell = '' }: SessionOptions = {}): Promise<CoreSession> {
       const openPayload = await request('session.open', SessionOpenRequest.encode({

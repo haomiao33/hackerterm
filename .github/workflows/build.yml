@@ -193,6 +193,18 @@ jobs:
   # ────────────────────────────────────────────────────────────────
   # smoke-windows：同一套端到端冒烟，跑在产品的**正式目标平台**上。
   #
+  # ── 【原则：全套测试两个平台都跑，Windows 上跑的不是子集】───────────────
+  # 曾经的想法是"一个测试只有在它真的需要 Windows 才放进 Windows job，不需要的
+  # 别放，免得制造假红"。**这条已经作废**，因为它被一个真实案例直接证伪了：
+  # e2e/latency-pairing.e2e.ts 验证的是"自动回复不产生样本"这条配对逻辑，按那条
+  # 原则它是"平台无关、不必进 Windows 门禁"的典型——而**正是因为它照样在
+  # Windows 上跑了，才暴露出焦点上报 `ESC[I` 这个配对漏洞**。那条上报只有真
+  # PowerShell 在回路里才会发，Linux 上永远不出现（Electron 里 PTY 子进程根本
+  # exec 不起来，没有 shell 去开模式 1004）。
+  # 结论：本地先做出来快速迭代，但远程跑的是**全套**。vitest 的 include 是
+  # `e2e/**/*.e2e.ts`（见 e2e/vitest.config.ts），所以新增的端到端文件会自动进入
+  # 这两个 job，不需要在这里逐个登记——**也不要**在这里加过滤把某些文件排除掉。
+  #
   # 为什么值得再跑一遍（不是重复上面的 smoke）：
   # 1. e2e/smoke.e2e.ts 里第二条断言「命令真的执行了：屏幕上出现 hello」
   #    在 Linux 上是**跳过**的——portable-pty 在 fork 之后 exec 之前调
@@ -203,6 +215,11 @@ jobs:
   #    job 能验证。
   # 2. 顺带覆盖 crates/ht-core/src/session.rs 里 Windows 专有的 ConPTY 分支
   #    和默认 shell（powershell.exe）路径。
+  # 3. **并发会话**（e2e/concurrency-core.e2e.ts，产品第②条的「10+ 并发会话」）：
+  #    12 条会话同时刷屏时，Windows 上是 12 个 conhost + 12 个 PowerShell，
+  #    每个都带 PSReadLine 的重绘和语法高亮，输出块的大小与节奏跟 bash 完全不是
+  #    一回事。串扰、读线程计数、内存这三件事的**路由逻辑**平台无关，但把它们
+  #    压到真实并发下的**负载形态**是平台相关的，所以两个平台都要跑。
   #
   # 【硬门禁，不加 continue-on-error】理由：
   # 这条链路正是连着两天没跑通 demo 的那条，而 Windows 是用户实际会跑的平台。
@@ -329,10 +346,31 @@ jobs:
   # 这张表就会淹没在一堆预期失败里，没人再当回事。
   # 摘要那一步挂 if: always()，测量挂了也照样写一页说明（而不是一片空白）。
   # ────────────────────────────────────────────────────────────────
+  # 【timeout-minutes 为什么从 60 收到 20】
+  # 这个 job 连着两次挂死（60 分钟一次、29 分钟一次），两次都停在同一行日志
+  # "· NAPI 段…" 之后再无输出。60 分钟对一个正常跑十来分钟的 job 来说等于
+  # **没有超时**——挂死和慢，从超时的角度看分辨不出来。而 Windows runner 是
+  # **双倍计费**，挂死一次就是一小时的真钱。
+  #
+  # 四层超时，从内到外必须保持 段 < 总兜底 < 步骤 < job 的大小关系：
+  #   1. 每一次等待（CDP 调用、连核心、开会话、cargo run）  各自 30-40 秒
+  #   2. 每一段测量（PTY / NAPI / FULL）                    4 / 3 / 4 分钟
+  #   3. 脚本总兜底（e2e/latency.ts 的 overallWatchdog）     12 分钟
+  #   4. 步骤级 timeout-minutes                             ConPTY 5、测量 13
+  #   5. job 级 timeout-minutes                             20   ← 本行
+  # 内层先开火，失败信息才说得清是**哪一步**挂的；job 级只是最后一道闸。
+  #
+  # 【20 分钟故意**小于**各层最坏情况之和，这是有意的】
+  # 把 4 和 5 层全部按最坏叠加是 10（install+两次 build）+ 5 + 13 = 28 分钟。
+  # 但"所有层同时触顶"这件事本身就是故障，不是正常运行——正常运行是
+  # install+build 约 8-10 分钟 + ConPTY 约 1 分钟 + 测量约 2 分钟 ≈ 13 分钟。
+  # 20 分钟给正常运行留了 50% 余量，同时把最坏情况的止损点从一小时压到 20 分钟。
+  # **如果哪天这个 job 在健康状态下被 20 分钟砍掉，正确做法是去看日志里哪一步
+  # 吃掉了时间（每步都有耗时），而不是把这个数字调回 60。**
   latency-windows:
     name: latency (windows, ConPTY vs 我们的 IPC)
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -388,6 +426,12 @@ jobs:
       # crates/ 下的既有代码，多跑几遍在外面合池是等价且零侵入的做法。）
       - name: Measure ConPTY roundtrip (纯 Rust, ×3)
         continue-on-error: true
+        # 单轮**正常**约 10 秒（80 轮 × 约 120ms），3 轮加起来半分钟上下，首轮可能
+        # 要现编 example。5 分钟是给"从端一直不回显、每轮都撞 2 秒上限"那种最坏
+        # 情况的止损点：那时单轮 ≈ 170 秒、3 轮 ≈ 8.5 分钟，会在这里被砍掉，
+        # 而不是一路拖到 job 级超时。砍掉也无妨——下一步和摘要页照常跑，
+        # 摘要会写明这一节"未测到"。
+        timeout-minutes: 5
         shell: bash
         run: |
           : > latency-conpty.log
@@ -400,8 +444,18 @@ jobs:
       # 摘要上的数字随时可以回来对账。
       # 注：GitHub 的 `shell: bash` 默认带 `-eo pipefail`，管道里 pnpm 挂了这一步
       # 就会红（然后被 continue-on-error 接住），不会出现"测量失败但步骤是绿的"。
+      # 脚本自己有三段硬上限（4+3+4=11 分钟）和一个 12 分钟的总兜底；这一步的
+      # timeout-minutes(13) 是它们全部失效时的最后一道，job 级的 20 再兜一层。
+      # 这四个数字必须保持 11 < 12 < 13 < 20 这个大小关系，改一个就要回来看其余的。
+      # 正常跑完只要 1-2 分钟——这些数字全是止损点，不是预期时长。
+      #
+      # 注：脚本现在会在**任何一段有效样本不够**时以非零退出码收尾（见
+      # e2e/latency.ts 的「本次测量的有效性」一节）。continue-on-error 让它不拦人，
+      # 但步骤会显示成红色、摘要页也会写明哪段没测到——而不是绿油油地贴一张
+      # 基于三个样本的假表。
       - name: Measure full Electron chain (pnpm measure:latency)
         continue-on-error: true
+        timeout-minutes: 13
         shell: bash
         run: pnpm measure:latency 2>&1 | tee latency-full.log
 
@@ -450,6 +504,24 @@ jobs:
   # pull_request 事件跳过本 job。
   # **今后任何新增的 runs-on: self-hosted 的 job 都必须照抄这一行。**
   #
+  # ── 【shell 一律用 powershell / 不用 pwsh，也不用 bash】────────────────────
+  # 这个 job 在用户真机上跑过一次，第一步就死在：
+  #     ##[error]pwsh: command not found
+  # 原因很朴素：**用户的 Win11 上只有 Windows PowerShell 5.1（powershell.exe），
+  # 没有装 PowerShell 7（pwsh.exe）**。而 GitHub 托管的 windows-latest 镜像预装了
+  # pwsh，所以同一行 `shell: pwsh` 在托管 runner 上一直是绿的——我们照抄过来时
+  # 默认"Windows 就是 Windows"，这个假设是错的：**托管镜像装了一堆东西，用户的
+  # 机器是裸的**。自托管 job 里能依赖的只有 Windows 自带的东西。
+  #
+  # 同理，这个 job 里原本几步 `shell: bash` 也一并换掉了。bash 在 Windows 上来自
+  # Git for Windows，虽然装了 runner 多半也装了 git，但那同样是个"大概装了吧"的
+  # 假设——而上面这次失败正是这类假设的产物，而且因为它挂在第一步，我们连
+  # bash 到底在不在都没能验证到。powershell.exe 是**系统组件**，任何 Windows 上
+  # 都在，这是唯一不需要假设的选择。
+  # 下面那几段 PowerShell 因此也必须守 5.1 的语法（没有 `??`、没有三元运算符、
+  # 没有 `ForEach-Object -Parallel`），写的时候注意。
+  # **今后任何 runs-on: self-hosted 的 job 都照这条办。**
+  #
   # ── 【continue-on-error: true，加在 job 上】理由 ────────────────────────
   # 这是一台**个人笔记本**，会关机、会合盖、会断网。runner 离线时这个 job 会一直
   # 排队直到超时，超时就是失败——而那种失败说明的是"笔记本没开机"，不是"代码坏
@@ -464,6 +536,13 @@ jobs:
     if: github.event_name != 'pull_request'
     continue-on-error: true
     timeout-minutes: 60
+    # 【关键一行】把本 job 所有 run 步骤的默认 shell 钉成 powershell（5.1）。
+    # 不这么写的话，没有显式声明 shell 的步骤会走 GitHub 在 Windows 上的默认值
+    # **pwsh**——正是那个在这台机器上不存在的东西。放在 job 级而不是逐步声明，
+    # 是为了让"以后有人加了一步但忘了写 shell:"这件事不再能重新引入同一个故障。
+    defaults:
+      run:
+        shell: powershell
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -473,7 +552,8 @@ jobs:
       # 而"这条查不到"本身就是有用的结论，不该让整步炸掉把其余事实一起带走。
       - name: 采集运行环境事实
         id: facts
-        shell: pwsh
+        # powershell（5.1）而不是 pwsh（7）：用户机器上没有 pwsh，见 job 顶部注释。
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
           $out = New-Object System.Collections.Generic.List[string]
@@ -541,7 +621,24 @@ jobs:
           } catch { Add-Fact 'defender_exclusions' "查询失败: $($_.Exception.Message)" }
 
           Add-Fact 'workspace' $env:GITHUB_WORKSPACE
-          $out | ForEach-Object { $_ } | Out-File -FilePath env-facts.tsv -Encoding utf8
+          # 顺带把"这台机器上有没有 pwsh"这件事也记下来——本 job 上一次真机运行就是
+          # 死在这上面（`pwsh: command not found`）。记录它，下次判断"能不能用 7 的
+          # 语法"有据可依，而不是再猜一次。同时记下自己实际跑在哪个版本上。
+          Add-Fact 'ps_version' $PSVersionTable.PSVersion.ToString()
+          Add-Fact 'ps_edition' $PSVersionTable.PSEdition
+          $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue)
+          Add-Fact 'pwsh_available' $(if ($pwshPath) { $pwshPath.Source } else { '(没有装 PowerShell 7)' })
+          $bashPath = (Get-Command bash -ErrorAction SilentlyContinue)
+          Add-Fact 'bash_available' $(if ($bashPath) { $bashPath.Source } else { '(没有 bash)' })
+
+          # 写文件不用 Out-File：5.1 的 `-Encoding utf8` 写的是**带 BOM** 的 UTF-8，
+          # 而这份表格随后要被读回来拼进摘要页，BOM 会变成第一行行首一个看不见的
+          # 怪字符。用 .NET 写无 BOM UTF-8，两边都干净。
+          [System.IO.File]::WriteAllLines(
+            (Join-Path (Get-Location).Path 'env-facts.tsv'),
+            [string[]]$out,
+            (New-Object System.Text.UTF8Encoding($false))
+          )
           Get-Content env-facts.tsv
 
       - name: Setup pnpm
@@ -563,15 +660,20 @@ jobs:
           version: "25.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # 同上：不用 bash（Windows 上它来自 Git for Windows，不是系统组件）。
+      # PowerShell 5.1 里判断上一个原生命令成没成功要看 $LASTEXITCODE——
+      # `if (pnpm install)` 那种写法在这里是错的（它判的是有没有输出，不是退出码）。
       - name: Install dependencies (pnpm install, retry x3)
-        shell: bash
+        shell: powershell
         run: |
-          for i in 1 2 3; do
-            pnpm install --frozen-lockfile && exit 0
-            echo "pnpm install failed (attempt $i/3), retrying in 5s..."
-            sleep 5
-          done
-          echo "pnpm install failed after 3 attempts"
+          $ErrorActionPreference = 'Continue'
+          for ($i = 1; $i -le 3; $i++) {
+            pnpm install --frozen-lockfile
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Write-Host "pnpm install failed (attempt $i/3), retrying in 5s..."
+            Start-Sleep -Seconds 5
+          }
+          Write-Host 'pnpm install failed after 3 attempts'
           exit 1
 
       - name: Build native module (napi-rs)
@@ -590,10 +692,25 @@ jobs:
       - name: 冷启动时间线（pnpm measure:startup）
         id: startup
         continue-on-error: true
-        shell: bash
         env:
           HT_STARTUP_RUNS: 5
-        run: pnpm measure:startup 2>&1 | tee startup-timeline.md
+        # bash 的 `2>&1 | tee` 在 PowerShell 5.1 里没有能照抄的等价物，三处都是坑：
+        # 1. 5.1 下原生命令的 stderr 经 `2>&1` 会变成 ErrorRecord 对象进管道，
+        #    直接写文件会带上一堆 NativeCommandError 噪声——先 `"$_"` 转成字符串。
+        # 2. `Tee-Object -Encoding` 是 PowerShell 6+ 才有的参数，5.1 上直接报错；
+        #    而 5.1 的 Tee-Object 默认写 **UTF-16LE**，下面拼摘要时会变乱码。
+        # 3. `Out-File -Encoding utf8` 在 5.1 上写的是**带 BOM** 的 UTF-8，BOM 会
+        #    以一个看不见的怪字符出现在摘要页第一行。
+        # 所以：先收集成字符串数组，回显一份给 job 日志，再用 .NET 直接写无 BOM UTF-8。
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $log = pnpm measure:startup 2>&1 | ForEach-Object { "$_" }
+          $log | Write-Host
+          [System.IO.File]::WriteAllLines(
+            (Join-Path (Get-Location).Path 'startup-timeline.md'),
+            [string[]]$log,
+            (New-Object System.Text.UTF8Encoding($false))
+          )
 
       # ── 事实采集③：Electron 到底能不能在这个环境下真的起来 ──────────────
       # 直接跑现有的端到端冒烟。它比任何环境查询都有说服力：能跑通就说明
@@ -608,10 +725,16 @@ jobs:
       # if: always()：上面任何一步挂了都要出报告，而且"挂了"本身就是结论。
       - name: 写入运行摘要
         if: always()
-        shell: pwsh
+        # 同上：powershell（5.1），不是 pwsh。见 job 顶部注释。
+        shell: powershell
         run: |
           $S = $env:GITHUB_STEP_SUMMARY
-          function W($t) { Add-Content -Path $S -Value $t }
+          # 【别用 Add-Content】PowerShell 5.1 的 Add-Content 默认编码是**系统 ANSI
+          # 代码页**（中文 Windows 上是 GBK），而摘要页按 UTF-8 解析——这一整页中文
+          # 会变成乱码。而且它不会报错，是典型的"看着跑绿了、结果是废的"。
+          # 用 .NET 直接追加无 BOM 的 UTF-8，编码就与平台的区域设置无关了。
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          function W($t) { [System.IO.File]::AppendAllText($S, "$t" + [Environment]::NewLine, $utf8NoBom) }
 
           W '## 自托管 runner 环境诊断'
           W ''

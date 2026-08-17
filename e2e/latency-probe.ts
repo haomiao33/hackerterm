@@ -63,6 +63,25 @@ export interface LatencyProbeSnapshot {
   writesOutsideRound: number
   /** 被接受为 t0 的按键 `onData` 次数，正常应等于轮数。 */
   keyDataEvents: number
+  /**
+   * 非按键 `onData` 按**上报类别**的计数，例如 `{ CPR: 3, FOCUS: 1 }`。
+   *
+   * 纯诊断，不参与任何配对判定。它存在的理由是上一轮的教训：Windows CI 红掉时，
+   * 日志里只有三行裸字节（`1b 5b 49`），得有人肉眼把它认成"焦点上报"才能往下查。
+   * 分类打在快照里，下次同类问题第一眼就能看出是哪种自动回复。
+   */
+  nonKeyKinds: Record<string, number>
+  /** 头几条非按键 `onData` 的十六进制原文，供分类不认识时回看原始字节。 */
+  nonKeySamples: string[]
+  /**
+   * 「一轮已经开着、且已经收到按键 t0，此时又冒出一条非按键 `onData`」的轮数。
+   *
+   * 这是**污染判定**：那条自动回复也会被写进 PTY 并回显回来，于是本轮的 t5 有可能
+   * 落在"自动回复的回显"上而不是"按键的回显"上，量出来的就不是按键往返。正常轮次
+   * 这个数应当是 0；不为 0 时样本仍然照记（不静默丢弃），但读数字的人必须知道
+   * 有这么多轮是可疑的。
+   */
+  taintedRounds: number
 }
 
 declare global {
@@ -73,6 +92,15 @@ declare global {
       /** 等这一轮的样本落地。返回 false 表示超时没等到（已计入 unpaired）。 */
       waitArmed(): Promise<boolean>
       snapshot(): LatencyProbeSnapshot
+      /**
+       * 把所有计数器和样本清零，回到刚装好的状态。
+       *
+       * 只给「**就绪探测**」用：探测阶段要反复按键直到回显通路真的活了（见
+       * latency-pairing.e2e.ts 的 `waitForEchoPath`），那些失败的轮次会把
+       * `unpaired` 和 `samples` 记花。清零之后正式阶段的计数才是干净的。
+       * `pnpm measure:latency`（latency.ts）**不调用它**，测量口径一个字没变。
+       */
+      reset(): void
     }
   }
 }
@@ -117,6 +145,72 @@ export function installLatencyProbe(config: { key: string, timeoutMs: number }):
   let unpaired = 0
   let writesOutsideRound = 0
   let keyDataEvents = 0
+  let nonKeyKinds: Record<string, number> = {}
+  let nonKeySamples: string[] = []
+  let taintedRounds = 0
+
+  /**
+   * 把一条非按键的 `onData` 归到某个**终端上报类别**。
+   *
+   * ── 判据为什么是「以 ESC(0x1b) 开头」而不是逐条枚举 ────────────────────
+   * 上一轮只堵了 CPR，Windows 上立刻又冒出焦点上报 `ESC[I`；再堵一条，下次换
+   * PSReadLine 问一次 DA2 又会重来。所以判据必须是**类级**的。
+   *
+   * 把 @xterm/xterm 6 里所有会主动往 `onData` 写东西的地方列全（源码实测，不是
+   * 猜的）：
+   *   - `common/InputHandler.ts:1672/1674`  DA1  `CSI c`   → `ESC[?1;2c` / `ESC[?6c`
+   *   - `common/InputHandler.ts:1711-1719`  DA2  `CSI > c` → `ESC[>0;276;0c` 等
+   *   - `common/InputHandler.ts:2264`       DECRPM（答 DECRQM）→ `ESC[?m;v$y`
+   *   - `common/InputHandler.ts:2657`       DSR 5（工作状态）→ `ESC[0n`
+   *   - `common/InputHandler.ts:2663`       DSR 6 / CPR（光标位置）→ `ESC[y;xR`
+   *   - `common/InputHandler.ts:2678`       DECXCPR `CSI ?6n` → `ESC[?y;xR`
+   *   - `common/InputHandler.ts:2856`       窗口操作 `CSI 18t` → `ESC[8;rows;colst`
+   *   - `common/InputHandler.ts:3418`       DCS 应答（DECRQSS/XTGETTCAP）→ `ESC P … ESC \`
+   *   - `common/services/CoreMouseService.ts:331`  鼠标上报 → `ESC[<…M/m`
+   *   - `browser/CoreBrowserTerminal.ts:270/294/1295/1297`  焦点上报（模式 1004）
+   *     → `ESC[I` / `ESC[O`   ← **这就是本轮 Windows CI 红掉的那一条**
+   *   - `browser/Clipboard.ts:23`           括号粘贴（模式 2004）→ `ESC[200~…ESC[201~`
+   *
+   * 这一整张表**无一例外**都以 ESC 开头——它们全都是 ANSI 控制序列（CSI `ESC[`
+   * 或 DCS `ESC P`）。而我们量的按键是一个**可打印字符**。于是判据就一条：
+   * **以 ESC 开头的一律是终端上报，永远不可能是我们要量的那次按键。**
+   * 将来 xterm 加了什么新的上报（XTVERSION、颜色查询 OSC 应答……）也照样落网，
+   * 不需要有人回来补名单——这正是"别只打补丁堵已知的两种"的意思。
+   *
+   * 下面细分的类别名**纯粹是给人看的诊断标签**，认不出来就归 `CSI-other` /
+   * `ESC-other`，不影响任何判定：判定只用上面那一条。
+   */
+  function classifyNonKey(data: string): string {
+    if (data.charCodeAt(0) !== 0x1b) return 'plain' // 不以 ESC 开头：不是终端上报
+    if (data.length < 2) return 'ESC-bare'
+    if (data[1] === 'P') return 'DCS'
+    if (data[1] !== '[') return 'ESC-other'
+    const body = data.slice(2)
+    if (/^[IO]$/.test(body)) return 'FOCUS' // ESC[I 进入 / ESC[O 离开
+    if (/^20[01]~$/.test(body)) return 'PASTE'
+    if (/^\?[\d;]*R$/.test(body)) return 'DECXCPR'
+    if (/^[\d;]*R$/.test(body)) return 'CPR'
+    if (/^\??[\d;]*c$/.test(body)) return 'DA'
+    if (/^[\d;]*n$/.test(body)) return 'DSR'
+    if (/^\??[\d;]*\$y$/.test(body)) return 'DECRPM'
+    if (/^[\d;]*t$/.test(body)) return 'WINOPS'
+    if (/^</.test(body)) return 'MOUSE'
+    return 'CSI-other'
+  }
+
+  /** 记一条非按键 `onData`：计数 + 分类 + 留前几条原始字节。 */
+  function noteNonKey(data: string): void {
+    nonKeyOnData += 1
+    const kind = classifyNonKey(data)
+    nonKeyKinds[kind] = (nonKeyKinds[kind] ?? 0) + 1
+    if (nonKeySamples.length < 12) {
+      let hex = ''
+      for (let i = 0; i < data.length; i++) {
+        hex += (i > 0 ? ' ' : '') + data.charCodeAt(i).toString(16).padStart(2, '0')
+      }
+      nonKeySamples.push(`${kind}: ${hex}`)
+    }
+  }
 
   // 一轮的状态机：idle →（arm）armed →（按键 onData）计时中 →（write 回调）已出结果。
   //
@@ -159,14 +253,42 @@ export function installLatencyProbe(config: { key: string, timeoutMs: number }):
       })
     },
     snapshot(): LatencyProbeSnapshot {
-      return { samples, nonKeyOnData, unpaired, writesOutsideRound, keyDataEvents }
+      return {
+        samples, nonKeyOnData, unpaired, writesOutsideRound, keyDataEvents,
+        nonKeyKinds, nonKeySamples, taintedRounds,
+      }
+    },
+    reset(): void {
+      samples.length = 0
+      nonKeyOnData = 0
+      unpaired = 0
+      writesOutsideRound = 0
+      keyDataEvents = 0
+      nonKeyKinds = {}
+      nonKeySamples = []
+      taintedRounds = 0
+      armed = false
+      result = null
+      t0 = null
+      settle = null
     },
   }
 
   term.onData((data: string) => {
-    // 关键的一行：xterm 的自动回复（CPR/DA…）也从这里出去，内容不等于按键字符。
-    // 拿它当 t0 就会凭空多出样本，见文件头注释。
-    if (data !== config.key) { nonKeyOnData += 1; return }
+    // 关键的一行：xterm 的自动回复（CPR/DA/焦点上报/DCS…）也从这里出去，内容不等于
+    // 按键字符。拿它当 t0 就会凭空多出样本，见文件头注释与 classifyNonKey 的说明。
+    //
+    // 判定本身仍然是最严的那一条——**内容必须正好等于那个按键字符**，这是
+    // classifyNonKey 那条"以 ESC 开头即上报"判据的超集：任何自动回复、任何将来新增
+    // 的上报、任何多字节序列都进不来。分类只用来产出可读的诊断。
+    if (data !== config.key) {
+      noteNonKey(data)
+      // 本轮已经拿到按键 t0 了，却又冒出一条自动回复：那条回复也会被写进 PTY 再
+      // 回显回来，本轮的 t5 有可能落在它的回显上而不是按键的回显上。样本照记
+      // （不静默丢弃），但把这一轮标成可疑。
+      if (armed && t0 !== null) taintedRounds += 1
+      return
+    }
     keyDataEvents += 1
     if (!armed) return
     t0 = performance.now()
