@@ -18,3 +18,6 @@ e2e/__screenshots__/__artifacts__/
 # 自托管 runner 诊断 job 在工作区根生成的原始产物（同样由 CI 当 artifact 上传）。
 env-facts.tsv
 startup-timeline.md
+# self-hosted 诊断 job 下载并解压 build 产物的两个目录（CI 里现生成，不入库）。
+dist-package/
+dist-unpacked/

@@ -159,11 +159,13 @@ jobs:
       # 共享库。GitHub 的 ubuntu 镜像大多已自带，这里显式装一遍，免得哪天换了镜像
       # 就以"Missing X server or $DISPLAY"这种和本项目毫无关系的错误红掉。
       #
-      # fonts-dejavu-core 是**视觉回归**（e2e/visual.e2e.ts）唯一的外部前提：
-      # 基线截图在 DejaVu Sans Mono 下生成，e2e/fixtures/fonts.conf 通过
-      # FONTCONFIG_FILE 把字体解析钉死到这一个文件，否则 `monospace` 会随机器
+      # fonts-dejavu-core 是**视觉回归**（e2e/visual.e2e.ts）在 Linux 上唯一的外部
+      # 前提：`.linux` 那套基线截图在 DejaVu Sans Mono 下生成，e2e/fixtures/fonts.conf
+      # 通过 FONTCONFIG_FILE 把字体解析钉死到这一个文件，否则 `monospace` 会随机器
       # 装了什么字体而变，基线永远对不上。装不上的话视觉回归会**跳过**（不是
       # 失败）——那两个真实发生过的渲染故障就重新失去防线，所以这一步必须成功。
+      # （Windows 那套基线是 `.win32` 后缀、在 smoke-windows job 里跑，钉的是
+      #  Consolas，跟这里互不相干——两个平台的字体栈不同，像素不可能一样。）
       - name: Install Electron runtime deps (xvfb + Chromium shared libs + 视觉回归字体)
         run: |
           sudo apt-get update
@@ -341,10 +343,48 @@ jobs:
       - name: Build Electron app
         run: pnpm build
 
+      # ────────────────────────────────────────────────────────────────
+      # 【临时步骤，拿到基线后立刻删】生成 Windows 视觉回归基线并上传。
+      # 基线必须在**目标平台上**生成，而这台机器上没有 Windows；唯一的办法就是让
+      # CI 生成一次、当 artifact 传下来、人眼看过再入库。
+      # ────────────────────────────────────────────────────────────────
+      - name: 【临时】生成 Windows 视觉回归基线
+        continue-on-error: true
+        run: pnpm test:e2e:update-screenshots
+
+      - name: 【临时】上传 Windows 基线
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-baselines-windows
+          path: e2e/__screenshots__/
+          if-no-files-found: warn
+
       # 不套 xvfb：Windows 有原生窗口系统，scripts/run-e2e.mjs 里那层包装的判据
       # 就是「Linux 且没有 DISPLAY」，在这里自然不会触发，直接跑 vitest。
+      #
+      # 【视觉回归现在也在这一步里跑】e2e/visual.e2e.ts 以前在 Windows 上是整个跳过的
+      # ——它那个"字体在不在"的前提检查写死了一个 Linux 路径。跳过是静默的（报告里
+      # 只是几个灰色的 skipped），于是"视觉回归在正式目标平台上一条都没跑"这件事一直
+      # 没人发现。现在改成**每平台一套独立基线**（e2e/__screenshots__/*.win32.png，
+      # 生成/比对规则见 e2e/screenshot.ts 的 PLATFORM_SUFFIX），Windows 侧靠 Consolas
+      # 这个**系统组件**级别的字体钉住渲染，不需要 fontconfig。
+      # 注意**没有**放宽比较阈值去跟 Linux 共用一张图：那样能容忍整片文字区域的差异，
+      # 这个测试要抓的两个故障就一个也抓不到了。
       - name: E2E smoke (Playwright + real Electron + ConPTY + real shell)
         run: pnpm test:e2e
+
+      # 同 linux smoke job：视觉回归红了之后唯一有用的信息是"哪几个像素不一样"，
+      # 而那只能看图。if: failure() —— 绿的时候这个目录压根不存在。
+      # 产物名带 -windows，跟 linux 那份分开，免得两个平台的图混在一起分不清。
+      - name: Upload visual diff artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-diff-windows
+          path: e2e/__screenshots__/__artifacts__/
+          if-no-files-found: ignore
 
   # ────────────────────────────────────────────────────────────────
   # latency-windows：把「键盘 → PTY → 屏幕」的时延分段测量搬到 CI，
@@ -517,9 +557,12 @@ jobs:
   #
   # 最有价值的一项是**真实冷启动耗时**：用户真机上 `main:fork_call →
   # main:core_spawn` 这一段曾经是 81 秒，关掉杀毒后掉到 504ms。那一轮排查是靠人
-  # 反复下载安装包手动开、一轮一天查出来的。这里用 `pnpm measure:startup`
-  # （e2e/startup-timeline.ts）把同一段变成可持续观测的自动化口径——**复用的是
-  # 现成的埋点**（src/main/startup-timing.ts + 页面诊断日志），没有另起一套。
+  # 反复下载安装包手动开、一轮一天查出来的。这个 job 把同一段变成可持续观测的
+  # 自动化口径——**复用的是现成的埋点**（src/main/startup-timing.ts + 页面诊断
+  # 日志），没有另起一套。
+  # 做法是**下载 build job 打好的那个 zip、解压、直接跑里面的 exe**，读它自己用
+  # `--enable-logging` 打出来的启动日志（详见下面「下载 build job 打好的 Windows 包」
+  # 那一步上方的注释）。这台机器上不装 Rust / protoc / pnpm 依赖，也不编译。
   #
   # ── 【安全门禁】if: github.event_name != 'pull_request' ──────────────────
   # 这一行是**必须的**，不是可选优化。本仓库是**公开仓库**，而自托管 runner
@@ -594,8 +637,22 @@ jobs:
     name: self-hosted 环境诊断 (DESKTOP-8GCTKR2)
     runs-on: [self-hosted, Windows, X64]
     if: github.event_name != 'pull_request'
+    # 【needs: build】本 job 现在**消费** build 打好的那个 zip，不再在真机上从源码
+    # 构建（理由见下面「下载 build job 打好的 Windows 包」那一步上方的长注释）。
+    # 这是本仓库唯一一个设了 needs 的 job：其余几个都刻意跟 build 并行，因为它们
+    # 各自 checkout 源码就能跑，没理由排队等出包。这个不一样——没有那个 zip，它
+    # 一件事也做不了。
+    # 顺带的副作用是可接受的：build 红了（或被取消）本 job 会被跳过。build 红的
+    # 时候本来也没有包可测，跳过比拿一个陈旧的包测出一份看着正常的报告要好——
+    # 后者正是本项目最忌讳的静默失效。
+    needs: build
     continue-on-error: true
-    timeout-minutes: 60
+    # 【60 → 20】从源码构建的时候，pnpm install + cargo 冷编译在这台没有 CI 缓存的
+    # 笔记本上就要五六分钟，60 分钟是给它们留的。现在整个 job 的工作量是"下载一个
+    # 包 + 解压 + 跑 5 轮启动"，正常一分钟上下；最坏情况是 5 轮全部撞满
+    # RUN_TIMEOUT_SEC(90s) = 7.5 分钟，再加下载解压也就十分钟出头。20 分钟给了
+    # 一倍余量，同时把"笔记本合盖了、job 挂在那里"的止损点从一小时压到 20 分钟。
+    timeout-minutes: 20
     # 【关键一行】把本 job 所有 run 步骤的默认 shell 钉成 powershell（5.1）。
     # 不这么写的话，没有显式声明 shell 的步骤会走 GitHub 在 Windows 上的默认值
     # **pwsh**——正是那个在这台机器上不存在的东西。放在 job 级而不是逐步声明，
@@ -965,85 +1022,366 @@ jobs:
           # re-read the UTF-8 file as the system ANSI code page.
           $out | Write-Host
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      # ── 【本 job 不再在真机上从源码构建，改为消费 build job 打好的那个包】──────
+      #
+      # 【改之前是什么样、为什么非改不可】
+      # 这个 job 原来的做法是照抄托管 runner：装 pnpm / Node / Rust / protoc →
+      # pnpm install → build:native → build → 跑测量。最近唯一一次真机运行就死在
+      # `Setup protoc` 这一步：arduino/setup-protoc@v3 去 GitHub releases 下 protoc
+      # 的 zip，网络 `read ECONNRESET` 把包下坏了，然后解压报出一个跟真实病因毫无
+      # 关系的错——「不是支持的存档文件格式」。后面 6 步全部 skipped，本 job 最有
+      # 价值的那项（真实冷启动耗时）一个数字都没产出。
+      # 这不是偶发：用户那台笔记本是家用网络，跨境拉 GitHub releases 本来就不稳，
+      # 而这条依赖**每跑一次就要重来一遍**。
+      #
+      # 【改成消费产物之后，三件事同时成立】
+      # 1. **那个网络卡点直接消失**：不再装 protoc（它是 prost-build 的编译期依赖，
+      #    而我们已经不编译了），也不再装 Rust / Node / pnpm 依赖。真机上剩下的
+      #    外部依赖只有「从 GitHub 下载一个 artifact」这一件——而那是 runner 自己
+      #    跟 GitHub 之间的通道，它要是不通，这个 job 根本排不上队。
+      # 2. **时间从 ~7 分钟缩到 ~1 分钟**：原来那 7 分钟里绝大部分是 pnpm install
+      #    和 cargo 编译（真机没有 CI 那套缓存，基本每次都是冷的）。现在只剩
+      #    下载 + 解压 + 跑 5 轮启动。这台机器是用户的**日常笔记本**，job 占着它
+      #    的 CPU 和风扇转 7 分钟是有实际代价的。
+      # 3. **测的正是用户实际拿到的那个包**——这一条才是真正的收益，前两条只是省
+      #    事。原来测的是"在这台机器上现编出来的 out/ 目录"，那个东西**没有任何
+      #    用户会运行**：它没打包、没进 asar、没走 electron-builder 的那套布局。
+      #    而当初 81 秒冷启动的病根恰恰是**打包形态**相关的（portable exe 每次启动
+      #    都往 %TEMP% 解压一遍 + Defender 对新解压文件的实时扫描，见 package.json
+      #    里 build.win.target 从 portable 换成 zip 那段注释）。用现编产物去量冷启动，
+      #    量的是一个用户永远不会遇到的场景。现在跑的是 release/*.zip 解压出来的
+      #    HackerTerm.exe，跟用户从 Actions 页面下载下来解压的是**同一个文件**。
+      #    （唯一残留的差别：用户那份是浏览器下载的，带 Mark-of-the-Web，Defender
+      #     对它更严格。这一条写在摘要页的可信度表里，不含糊过去。）
+      #
+      # 【代价：不再能验证"这台机器能不能编译"】原来 build:native / build 两步顺带
+      # 回答了这个问题。但那从来不是本 job 的目的（它的目的是诊断**运行环境**），
+      # 而且托管 runner 的 build job 每次都在回答"代码能不能编出来"。真要查真机的
+      # 编译环境，那是另一件事，不该压在这个每次 push 都跑的诊断上。
+      - name: 下载 build job 打好的 Windows 包
+        uses: actions/download-artifact@v4
         with:
-          node-version: 22
+          name: hackerterm-windows-x64
+          path: dist-package
 
-      - name: Setup Rust (stable, MSVC)
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - name: Setup protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "25.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-
-      # 同上：不用 bash（Windows 上它来自 Git for Windows，不是系统组件）。
-      # PowerShell 5.1 里判断上一个原生命令成没成功要看 $LASTEXITCODE——
-      # `if (pnpm install)` 那种写法在这里是错的（它判的是有没有输出，不是退出码）。
-      - name: Install dependencies (pnpm install, retry x3)
+      # 解压 + 定位 exe。这一步**不挂 continue-on-error**：它是纯本地文件操作，
+      # 失败只可能意味着 build job 的产物形状变了（比如 electron-builder 的 target
+      # 又换了），那是必须有人立刻知道的事，不该被当成"这台机器的毛病"消音。
+      #
+      # ── 下面这些本来该写在脚本里的中文注释，按本 job 的规矩搬到 YAML 层 ──────
+      # * 【为什么用 Expand-Archive】它是 PowerShell 5.0 起自带的 cmdlet，属于
+      #   Windows 自带的东西；tar.exe 虽然 Win10 1803 之后也自带，但它对 zip 的
+      #   支持是 libarchive 的顺带能力，遇到中文路径/长路径的行为没那么好预测。
+      # * 【为什么先 Remove-Item 再解压】自托管 runner 的工作区**不会**在两次运行
+      #   之间清空。上一轮解压出来的旧 exe 留在那儿，这一轮解压如果因为任何原因
+      #   没覆盖到（文件被占用是最常见的），我们就会拿着**上一次的包**测这一次的
+      #   代码，而且全程绿灯——这正是本项目最典型的静默失效。
+      # * 【为什么显式 exit 0】GitHub 的 powershell 包装器会追加 `exit $LASTEXITCODE`，
+      #   而这段里没有原生命令，$LASTEXITCODE 可能是上一步留下的陈旧值。
+      - name: 解压安装包并定位 HackerTerm.exe
+        id: unpack
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Continue'
-          for ($i = 1; $i -le 3; $i++) {
-            pnpm install --frozen-lockfile
-            if ($LASTEXITCODE -eq 0) { exit 0 }
-            Write-Host "pnpm install failed (attempt $i/3), retrying in 5s..."
-            Start-Sleep -Seconds 5
+          $ErrorActionPreference = 'Stop'
+
+          # ASCII ONLY in this script -- see the job header comment.
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          $root = (Get-Location).Path
+          $src = Join-Path $root 'dist-package'
+          $dest = Join-Path $root 'dist-unpacked'
+
+          $zip = Get-ChildItem -LiteralPath $src -Filter '*.zip' | Select-Object -First 1
+          if (-not $zip) {
+            throw "No *.zip inside $src -- the build job's artifact layout changed (see build.win.target in package.json)."
           }
-          Write-Host 'pnpm install failed after 3 attempts'
-          exit 1
+          Write-Host "package: $($zip.Name) ($([math]::Round($zip.Length / 1MB, 1)) MB)"
 
-      - name: Build native module (napi-rs)
-        id: build_native
-        continue-on-error: true
-        run: pnpm build:native
+          if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $dest -Force
 
-      - name: Build Electron app
-        id: build_app
-        continue-on-error: true
-        run: pnpm build
+          $exe = Get-ChildItem -LiteralPath $dest -Filter 'HackerTerm.exe' -Recurse | Select-Object -First 1
+          if (-not $exe) {
+            throw "HackerTerm.exe not found under $dest -- productName in package.json changed?"
+          }
+          Write-Host "exe: $($exe.FullName)"
+
+          # Do NOT use Add-Content / Out-File here: on 5.1 they write the system
+          # ANSI code page, and this path can contain non-ASCII characters.
+          [System.IO.File]::AppendAllText(
+            $env:GITHUB_OUTPUT,
+            "exe=$($exe.FullName)" + [Environment]::NewLine,
+            $utf8NoBom
+          )
+          exit 0
 
       # ── 事实采集②：真实冷启动耗时（本 job 最有价值的一项） ──────────────
-      # 跑的是真实构建产物，用的是现成埋点。5 轮取中位数：单轮受实时扫描/缓存
-      # 影响很大，一个数字说明不了问题。
-      - name: 冷启动时间线（pnpm measure:startup）
+      #
+      # 【为什么不再用 pnpm measure:startup】那条命令要 tsx + playwright-core +
+      # vitest，也就是要 `pnpm install`——正是这次要拿掉的东西。所以同一件事换个
+      # 做法：直接把安装包里的 exe 起起来，读它**自己打出来的**那份启动日志。
+      # 埋点一行没加、也一行没改，跟 e2e/startup-timeline.ts 读的是同一批标签
+      # （src/main/startup-timing.ts + src/ui/browser/diagnostics/log.ts）。
+      #
+      # 【怎么把渲染进程的日志弄出来】Electron 的 `--enable-logging` 开关会让
+      # 渲染进程的 console 落到 Chromium 的日志里（src/ui/browser/diagnostics/log.ts
+      # 顶部就是按这条路径设计的：那里刻意只用最朴素的 console.log，就是为了它在
+      # 打包之后仍然可读）。这里用 `--enable-logging=file --log-file=<路径>` 写文件
+      # 而不是让它进 stderr：Windows 上 Electron 主 exe 是 GUI 子系统程序，它的
+      # stdout/stderr 能不能被父进程可靠地收全，取决于句柄怎么建——写文件没有这个
+      # 不确定性。同时**仍然**把 stdout/stderr 各重定向到一个文件并一起解析：主
+      # 进程自己 console.log 的那些行走的是另一条路，两边都收着，代价只是多两个
+      # 小文件。`--log-level=0` = INFO，console 消息就是这一级，不开就没有。
+      #
+      # 【怎么知道"起来了"】判据是页面日志里的 `data port ready`——那一行意味着
+      # 协议握手成功、session.open 成功、数据面 MessagePort 两端都接好了（判据
+      # 与 e2e/electron-app.ts 里 launchApp 等的那个是同一件事的两种表述）。
+      # 用它而不是"进程还活着"：进程活着但页面白屏，正是这条链路最典型的故障形态。
+      #
+      # 【这一步同时替代了原来的 E2E 冒烟步骤】原来那步（pnpm test:e2e）问的是
+      # "Electron 能不能在 Session 0 里真的起来"。现在这一步问的是同一个问题，
+      # 而且问得更直接：它跑的是**用户手里那个 exe**，不是测试脚手架拉起来的
+      # out/main/index.js。跑不到 `data port ready` 就是"起不来"，报告里会明说。
+      # 少掉的那部分（敲键 → PTY → 屏幕的断言）由托管 runner 上的 smoke /
+      # smoke-windows 两个 job 覆盖，它们本来就是这条链路的红绿灯。
+      #
+      # 【常量取值依据】（本项目禁止魔数，每个数字都要有名字和来由）
+      # * HT_STARTUP_RUNS = 5：单轮受实时扫描/文件系统缓存影响极大（真机上同一个
+      #   包冷热两轮能差两个数量级），一个数字说明不了问题；取中位数抗单轮抖动。
+      # * RUN_TIMEOUT_SEC = 90：真机上出问题时那一段曾经是 81 秒，上限必须**大于**
+      #   已知的最坏值，否则我们会把"慢"误判成"起不来"——那正是这份报告要区分的
+      #   两件事。留 90 秒 = 81 秒 + 约 10% 余量。
+      # * GPU_SETTLE_MS = 3000：GPU 状态要等 `gpu-info-update` 静默收敛才落笔
+      #   （见 src/main/index.ts 的 GPU_STATUS_SETTLE_MS）；数值与
+      #   e2e/startup-timeline.ts 里那个 3 秒等待保持一致，两份报告口径才可比。
+      # * POLL_MS = 250：轮询日志文件的间隔。它只决定测得的墙上时间有多少量化
+      #   误差（最多 250ms），而这份报告关心的是秒级差异，再密没有意义。
+      # * KILL_SETTLE_MS = 500：taskkill 之后给进程树一点收尾时间再进下一轮，
+      #   免得上一轮的 utility 进程还占着日志文件。
+      - name: 冷启动时间线（直接跑安装包里的 exe）
         id: startup
         continue-on-error: true
         env:
-          HT_STARTUP_RUNS: 5
-        # bash 的 `2>&1 | tee` 在 PowerShell 5.1 里没有能照抄的等价物，三处都是坑：
-        # 1. 5.1 下原生命令的 stderr 经 `2>&1` 会变成 ErrorRecord 对象进管道，
-        #    直接写文件会带上一堆 NativeCommandError 噪声——先 `"$_"` 转成字符串。
-        # 2. `Tee-Object -Encoding` 是 PowerShell 6+ 才有的参数，5.1 上直接报错；
-        #    而 5.1 的 Tee-Object 默认写 **UTF-16LE**，下面拼摘要时会变乱码。
-        # 3. `Out-File -Encoding utf8` 在 5.1 上写的是**带 BOM** 的 UTF-8，BOM 会
-        #    以一个看不见的怪字符出现在摘要页第一行。
-        # 所以：先收集成字符串数组，回显一份给 job 日志，再用 .NET 直接写无 BOM UTF-8。
+          HT_STARTUP_RUNS: '5'
+          HT_EXE: ${{ steps.unpack.outputs.exe }}
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Continue'
-          $log = pnpm measure:startup 2>&1 | ForEach-Object { "$_" }
-          $log | Write-Host
-          [System.IO.File]::WriteAllLines(
-            (Join-Path (Get-Location).Path 'startup-timeline.md'),
-            [string[]]$log,
-            (New-Object System.Text.UTF8Encoding($false))
+
+          # ASCII ONLY in this script -- see the job header comment. Every piece of
+          # Chinese prose in the report is emitted as an '@token@' and translated by
+          # the summary step against .github/selfhosted-diagnose-summary.zh-CN.md.
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+          $RUNS = [int]$env:HT_STARTUP_RUNS
+          $EXE = $env:HT_EXE
+          $READY_MARKER = 'data port ready'
+          $RUN_TIMEOUT_SEC = 90
+          $GPU_SETTLE_MS = 3000
+          $POLL_MS = 250
+          $KILL_SETTLE_MS = 500
+
+          # Read a file another process is still writing to. Get-Content would open
+          # it with a share mode that the writer may not tolerate; an explicit
+          # FileShare.ReadWrite never fights the app for the handle.
+          function Read-Shared($p) {
+            if (-not (Test-Path -LiteralPath $p)) { return '' }
+            try {
+              $fs = New-Object System.IO.FileStream($p, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+              $sr = New-Object System.IO.StreamReader($fs)
+              $t = $sr.ReadToEnd()
+              $sr.Close()
+              $fs.Close()
+              return $t
+            } catch { return '' }
+          }
+
+          # label -> offset(ms), same axis as the page's own '+Xms' prefixes.
+          # Format produced by src/ui/browser/diagnostics/startup-timing.ts:
+          #   +142ms main:fork_call: +12ms (...)
+          # Chromium wraps it as: [pid:...:INFO:CONSOLE(n)] "<that>", source: ...
+          # so the pattern is matched anywhere in the line, not anchored.
+          $TIMING_RE = '\+\d+ms ([A-Za-z-]+:[A-Za-z_]+): ([+-]?\d+)ms'
+          $MARKS = @('requesting control port', 'control port ready', 'data port ready')
+          # token, from-label, to-label
+          $SEGMENTS = @(
+            @('@seg-ready-fork@',      'main:app_whenReady',              'main:fork_call'),
+            @('@seg-fork-spawn@',      'main:fork_call',                  'main:core_spawn'),
+            @('@seg-htnode-import@',   'core-host:ht_node_import_start',  'core-host:ht_node_import_end'),
+            @('@seg-fork-ctrlport@',   'main:fork_call',                  'main:control_port_request'),
+            @('@seg-ctrlport-load@',   'main:control_port_request',       'main:did_finish_load'),
+            @('@seg-gpu-info@',        'main:app_whenReady',              'main:gpu_status_first_update')
           )
 
-      # ── 事实采集③：Electron 到底能不能在这个环境下真的起来 ──────────────
-      # 直接跑现有的端到端冒烟。它比任何环境查询都有说服力：能跑通就说明
-      # Playwright 经 CDP 驱动 Electron 这条路不受 Session 0 影响（页面输入走
-      # Input.dispatchKeyEvent，不需要可见桌面）。
-      - name: E2E smoke（现有冒烟测试，判断 Electron 能否真的启动）
-        id: smoke
-        continue-on-error: true
-        run: pnpm test:e2e
+          function Get-Median($vals) {
+            $s = @($vals | Sort-Object)
+            if ($s.Count -eq 0) { return $null }
+            if ($s.Count % 2 -eq 1) { return $s[[int](($s.Count - 1) / 2)] }
+            return [int](($s[$s.Count / 2 - 1] + $s[$s.Count / 2]) / 2)
+          }
+
+          function Format-Ms($v) {
+            if ($null -eq $v) { return '-' }
+            # Bold anything in the seconds range: that IS the finding.
+            if ($v -ge 10000) { return ('**' + [math]::Round($v / 1000, 1) + ' s**') }
+            if ($v -ge 1000) { return ([math]::Round($v / 1000, 2).ToString() + ' s') }
+            return "$v ms"
+          }
+
+          $results = New-Object System.Collections.Generic.List[object]
+          $failures = New-Object System.Collections.Generic.List[string]
+
+          for ($i = 1; $i -le $RUNS; $i++) {
+            $chromeLog = Join-Path $env:RUNNER_TEMP "ht-startup-$i.chromium.log"
+            $outLog = Join-Path $env:RUNNER_TEMP "ht-startup-$i.stdout.log"
+            $errLog = Join-Path $env:RUNNER_TEMP "ht-startup-$i.stderr.log"
+            # Stale files from an earlier run on this self-hosted box would be read
+            # as if they were this run's output. Delete, do not append.
+            foreach ($f in @($chromeLog, $outLog, $errLog)) {
+              if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force }
+            }
+
+            # Quote the log path: Start-Process joins the array with spaces and does
+            # no quoting of its own, and RUNNER_TEMP can sit under a path with spaces.
+            $exeArgs = @('--enable-logging=file', ('--log-file="' + $chromeLog + '"'), '--log-level=0')
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $proc = $null
+            try {
+              $proc = Start-Process -FilePath $EXE -ArgumentList $exeArgs -PassThru -NoNewWindow -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+            } catch {
+              $failures.Add("run $i : Start-Process failed: $($_.Exception.Message)")
+              continue
+            }
+
+            $ready = $false
+            $wallMs = -1
+            $deadline = (Get-Date).AddSeconds($RUN_TIMEOUT_SEC)
+            while ((Get-Date) -lt $deadline) {
+              Start-Sleep -Milliseconds $POLL_MS
+              $text = (Read-Shared $chromeLog) + "`n" + (Read-Shared $outLog) + "`n" + (Read-Shared $errLog)
+              if ($text.Contains($READY_MARKER)) {
+                $ready = $true
+                $wallMs = [int]$sw.ElapsedMilliseconds
+                break
+              }
+              if ($proc.HasExited) { break }
+            }
+
+            # Read HasExited BEFORE killing: after taskkill it is always true, and
+            # "the app died on its own" vs "we timed out on a live app" are two
+            # completely different findings.
+            $exitedOnItsOwn = $proc.HasExited
+
+            # GPU status arrives after mount (gpu-info-update has to settle first),
+            # so keep the app alive a bit longer once it is up.
+            if ($ready) { Start-Sleep -Milliseconds $GPU_SETTLE_MS }
+            $text = (Read-Shared $chromeLog) + "`n" + (Read-Shared $outLog) + "`n" + (Read-Shared $errLog)
+            $logBytes = $text.Trim().Length
+
+            # /T: Electron leaves a utility process and a GPU process behind;
+            # killing only the parent would leave them holding the log file.
+            try { & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null } catch { }
+            Start-Sleep -Milliseconds $KILL_SETTLE_MS
+
+            if (-not $ready) {
+              # A live process that produced ZERO log bytes is NOT evidence that the
+              # app failed to start -- it is evidence that the log never reached us.
+              # Reporting that as "the app never came up" would be a fabricated
+              # conclusion, which this project treats as worse than no conclusion.
+              if ($logBytes -eq 0 -and -not $exitedOnItsOwn) {
+                $failures.Add("run $i : @startup-nolog@ (timeout " + $RUN_TIMEOUT_SEC + "s)")
+              } else {
+                $failures.Add("run $i : @startup-runfail@ (timeout " + $RUN_TIMEOUT_SEC + "s), exited=" + $exitedOnItsOwn + ", log bytes=" + $logBytes)
+              }
+              continue
+            }
+
+            $timings = @{}
+            $marks = @{}
+            $gpu = ''
+            foreach ($line in ($text -split "`n")) {
+              $m = [regex]::Match($line, $TIMING_RE)
+              if ($m.Success) { $timings[$m.Groups[1].Value] = [int]$m.Groups[2].Value }
+              if (-not $gpu) {
+                $g = [regex]::Match($line, 'main:gpu_feature_status: (.+)$')
+                # Strip Chromium's console-line tail: "<message>", source: file://...
+                if ($g.Success) { $gpu = ($g.Groups[1].Value -replace '"\s*,\s*source:.*$', '').Trim() }
+              }
+              foreach ($mk in $MARKS) {
+                if ($marks.ContainsKey($mk)) { continue }
+                $mm = [regex]::Match($line, '\+(\d+)ms ' + [regex]::Escape($mk))
+                if ($mm.Success) { $marks[$mk] = [int]$mm.Groups[1].Value }
+              }
+            }
+            $results.Add(@{ timings = $timings; marks = $marks; gpu = $gpu; wall = $wallMs })
+            Write-Host ("run $i : ready in $wallMs ms, " + $timings.Count + " timing labels, " + $marks.Count + " marks")
+          }
+
+          $md = New-Object System.Collections.Generic.List[string]
+          $md.Add('### @startup-title@')
+          $md.Add('')
+          $md.Add("- @startup-runs@: $RUNS (@startup-ok@ " + $results.Count + ", @startup-failed@ " + $failures.Count + ')')
+          $md.Add('- @startup-exe@: `' + $EXE + '`')
+          $md.Add('')
+
+          if ($failures.Count -gt 0) {
+            $md.Add('#### @startup-failrows@')
+            $md.Add('')
+            foreach ($f in $failures) { $md.Add("- $f") }
+            $md.Add('')
+          }
+
+          if ($results.Count -eq 0) {
+            $md.Add('> @startup-nolaunch@')
+            [System.IO.File]::WriteAllLines((Join-Path (Get-Location).Path 'startup-timeline.md'), [string[]]$md, $utf8NoBom)
+            $md | Write-Host
+            # Non-zero on purpose: "the app never came up" must not look like a
+            # successful measurement. continue-on-error keeps it from blocking.
+            exit 1
+          }
+
+          $md.Add('| @col-segment@ | @col-median@ | @col-perrun@ |')
+          $md.Add('| --- | ---: | --- |')
+          foreach ($seg in $SEGMENTS) {
+            $perRun = New-Object System.Collections.Generic.List[string]
+            $valid = New-Object System.Collections.Generic.List[int]
+            foreach ($r in $results) {
+              $a = $r.timings[$seg[1]]
+              $b = $r.timings[$seg[2]]
+              if ($null -eq $a -or $null -eq $b) { $perRun.Add('-'); continue }
+              $d = [int]($b - $a)
+              $valid.Add($d)
+              $perRun.Add("$d ms")
+            }
+            $median = if ($valid.Count -gt 0) { Get-Median $valid } else { $null }
+            $md.Add('| ' + $seg[0] + ' | ' + (Format-Ms $median) + ' | ' + ($perRun -join ', ') + ' |')
+          }
+          $md.Add('')
+          $wallAll = @($results | ForEach-Object { $_.wall })
+          $md.Add('**@startup-wall@**: ' + (Format-Ms (Get-Median $wallAll)) + ' (' + (($wallAll | ForEach-Object { "$_ ms" }) -join ', ') + ')')
+          $md.Add('')
+
+          $md.Add('| @col-mark@ | @col-hit@ | @col-first@ |')
+          $md.Add('| --- | ---: | ---: |')
+          foreach ($mk in $MARKS) {
+            $hit = @($results | Where-Object { $_.marks.ContainsKey($mk) }).Count
+            $first = $results[0].marks[$mk]
+            $md.Add('| `' + $mk + '` | ' + $hit + '/' + $results.Count + ' | ' + (Format-Ms $first) + ' |')
+          }
+          $md.Add('')
+
+          $md.Add('#### @startup-gpu@')
+          $md.Add('')
+          $gpus = @($results | ForEach-Object { $_.gpu } | Where-Object { $_ })
+          if ($gpus.Count -eq 0) {
+            $md.Add('> @startup-nogpu@')
+          } else {
+            $n = 1
+            foreach ($g in $gpus) { $md.Add("$n. ``$g``"); $n++ }
+          }
+
+          [System.IO.File]::WriteAllLines((Join-Path (Get-Location).Path 'startup-timeline.md'), [string[]]$md, $utf8NoBom)
+          $md | Write-Host
+          exit 0
 
       # ── 汇总成人能一眼看懂的表格 ──────────────────────────────────────
       # if: always()：上面任何一步挂了都要出报告，而且"挂了"本身就是结论。
@@ -1157,8 +1495,10 @@ jobs:
           if ($rows.Count -eq 0) { $rows.Add('| - | ' + (Fallback '@facts-missing@' 'env-facts.tsv was not produced') + ' |') }
 
           # --- startup timeline block ---------------------------------------
+          # Localize here too: the startup step is ASCII-only like every script in
+          # this job, so it emits '@token@' markers where Chinese prose belongs.
           $startup = New-Object System.Collections.Generic.List[string]
-          foreach ($l in $startupLines) { $startup.Add($l) }
+          foreach ($l in $startupLines) { $startup.Add(Localize $l) }
           if ($startup.Count -eq 0) { $startup.Add('> ' + (Fallback '@startup-missing@' 'startup-timeline.md was not produced')) }
 
           # --- render -------------------------------------------------------
@@ -1166,10 +1506,8 @@ jobs:
           $blocks['{{FACTS_TABLE}}'] = $rows
           $blocks['{{STARTUP_TIMELINE}}'] = $startup
           $inline = @{}
-          $inline['{{OUTCOME_BUILD_NATIVE}}'] = '${{ steps.build_native.outcome }}'
-          $inline['{{OUTCOME_BUILD_APP}}'] = '${{ steps.build_app.outcome }}'
+          $inline['{{OUTCOME_UNPACK}}'] = '${{ steps.unpack.outcome }}'
           $inline['{{OUTCOME_STARTUP}}'] = '${{ steps.startup.outcome }}'
-          $inline['{{OUTCOME_SMOKE}}'] = '${{ steps.smoke.outcome }}'
 
           foreach ($line in $body) {
             $key = $line.Trim()

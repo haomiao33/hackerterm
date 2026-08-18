@@ -22,6 +22,33 @@ export const SCREENSHOT_DIR = path.join(REPO_ROOT, 'e2e/__screenshots__')
 export const ARTIFACT_DIR = path.join(SCREENSHOT_DIR, '__artifacts__')
 
 /**
+ * 基线文件名里的平台后缀（`terminal-light.linux.png` / `terminal-light.win32.png`）。
+ *
+ * 为什么**每个平台一套基线**，而不是共用一张图：
+ * 终端里 99% 的像素都是字形，而字形是操作系统的字体栈画出来的——Linux 上是
+ * fontconfig + FreeType 渲染 DejaVu Sans Mono，Windows 上是 DirectWrite 渲染
+ * Consolas。字体不同、光栅化器不同、抗锯齿算法不同，同一段文字在两个平台上
+ * **不可能**得到相同的像素。这不是 bug，是两个平台本来就长得不一样。
+ *
+ * 那为什么不改成"共用一张基线 + 把比较阈值放宽到能容忍字体差异"：
+ * 因为跨平台的字形差异是**整片文字区域**级别的（远大于任何真实回归），要放宽到
+ * 能容忍它，等于把阈值调到"整块文字都变了也不算差异"。到那个程度，这个测试要抓
+ * 的两个历史故障（xterm.css 没引入导致布局塌缩、亮色主题光标与白底零像素差异）
+ * 一个都抓不到了——它会变成一个永远绿、什么都测不出来的摆设，正是本项目最痛恨
+ * 的那种"看着在测、其实测不出东西"。所以阈值一个字不动（见 PIXEL_THRESHOLD），
+ * 改的是"跟谁比"：每个平台只跟**自己平台**的基线比，比的仍然是严格逐像素相等。
+ *
+ * 用 `process.platform` 而不是自己编一套名字：它就是 Node 对"哪个操作系统"的
+ * 唯一事实来源（linux / win32 / darwin），多一层映射只会多一处能写错的地方。
+ */
+export const PLATFORM_SUFFIX = process.platform
+
+/** 某个平台的基线文件名（不含目录）。生成与比对两侧必须走同一个函数，免得写歪。 */
+export function baselineFileName(name: string): string {
+  return `${name}.${PLATFORM_SUFFIX}.png`
+}
+
+/**
  * 置为 1 时不比对，直接把当前渲染结果写成新基线。
  * 用法：`HT_UPDATE_SCREENSHOTS=1 pnpm test:e2e visual`（也有 npm script 包好）。
  */
@@ -54,7 +81,7 @@ const PIXEL_THRESHOLD = 0.1
  * 测试自己写错了的 Error。
  */
 export function compareToBaseline(name: string, actualPng: Buffer): DiffResult {
-  const baselinePath = path.join(SCREENSHOT_DIR, `${name}.png`)
+  const baselinePath = path.join(SCREENSHOT_DIR, baselineFileName(name))
 
   if (UPDATING) {
     mkdirSync(SCREENSHOT_DIR, { recursive: true })
@@ -69,8 +96,9 @@ export function compareToBaseline(name: string, actualPng: Buffer): DiffResult {
 
   if (!existsSync(baselinePath)) {
     throw new Error(
-      `缺少基线截图 ${baselinePath}。\n` +
-      '生成办法：pnpm test:e2e:update-screenshots\n' +
+      `缺少 ${PLATFORM_SUFFIX} 平台的基线截图 ${baselinePath}。\n` +
+      '基线是每平台一套的（字体栈不同，像素必然不同，见 PLATFORM_SUFFIX 的注释），\n' +
+      `所以必须在 ${PLATFORM_SUFFIX} 上生成：pnpm test:e2e:update-screenshots\n` +
       '生成后必须人工看一眼图对不对再入库——基线是错的，测试再绿也没有意义。',
     )
   }
@@ -80,14 +108,14 @@ export function compareToBaseline(name: string, actualPng: Buffer): DiffResult {
   const totalPixels = baseline.width * baseline.height
 
   if (actual.width !== baseline.width || actual.height !== baseline.height) {
-    writeArtifact(`${name}.actual.png`, actualPng)
+    writeArtifact(`${name}.${PLATFORM_SUFFIX}.actual.png`, actualPng)
     return {
       diffPixels: totalPixels,
       totalPixels,
       summary:
         `尺寸不一致：基线 ${baseline.width}×${baseline.height}，实际 ` +
         `${actual.width}×${actual.height}。布局塌缩（比如 xterm.css 没被引入）就是这个症状。` +
-        `实际图已写到 ${path.join(ARTIFACT_DIR, `${name}.actual.png`)}`,
+        `实际图已写到 ${path.join(ARTIFACT_DIR, `${name}.${PLATFORM_SUFFIX}.actual.png`)}`,
     }
   }
 
@@ -98,8 +126,8 @@ export function compareToBaseline(name: string, actualPng: Buffer): DiffResult {
   )
 
   if (diffPixels > 0) {
-    writeArtifact(`${name}.actual.png`, actualPng)
-    writeArtifact(`${name}.diff.png`, PNG.sync.write(diff))
+    writeArtifact(`${name}.${PLATFORM_SUFFIX}.actual.png`, actualPng)
+    writeArtifact(`${name}.${PLATFORM_SUFFIX}.diff.png`, PNG.sync.write(diff))
   }
 
   const percent = ((diffPixels / totalPixels) * 100).toFixed(4)
